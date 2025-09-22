@@ -196,7 +196,7 @@ std::tuple<RequestVector, RequestVector> NonMixBatchingScheduler::operator()(
     OptionalRef<kv_cache_manager::BaseKVCacheManager const> crossKvCacheManager,
     OptionalRef<BasePeftCacheManager const> peftCacheManager, RequestList const& activeRequests) const
 {
-    // Step 1: Categorize requests into context and generation types
+    // Categorize requests into context and generation types
     auto [contextRequests, generationRequests] = categorizeRequests(activeRequests);
 
     // Early return if no schedulable requests
@@ -205,10 +205,10 @@ std::tuple<RequestVector, RequestVector> NonMixBatchingScheduler::operator()(
         return {RequestVector{}, RequestVector{}};
     }
 
-    // Step 2: Determine scheduling strategy (context priority)
+    // Determine scheduling strategy (context priority)
     bool shouldScheduleContext = determineSchedulingStrategy(contextRequests, generationRequests);
 
-    // Step 3: Initialize KV cache block reuse optimization
+    // Initialize KV cache block reuse optimization
     bool skippingIsRelevant
         = kvCacheManager.isEnableBlockReuse() || (crossKvCacheManager && crossKvCacheManager->isEnableBlockReuse());
 
@@ -222,13 +222,13 @@ std::tuple<RequestVector, RequestVector> NonMixBatchingScheduler::operator()(
             = prefillWithChunkedContextsAlreadyExecuting(activeRequests, kvCacheManager, crossKvCacheManager);
     }
 
-    // Step 4: Schedule requests with resource management and optimization
+    // Schedule requests with resource management and optimization
     RequestVector const& requestsToSchedule = shouldScheduleContext ? contextRequests : generationRequests;
     RequestVector scheduledRequests
         = scheduleRequests(requestsToSchedule, shouldScheduleContext, skippingIsRelevant, kvCacheManager,
             crossKvCacheManager, peftCacheManager, newlyContributedContextBlocks, newlyContributedCrossContextBlocks);
 
-    // Step 5: Update state and logging
+    // Update state and logging
     if (!scheduledRequests.empty())
     {
         mLastWasContext = shouldScheduleContext;
@@ -280,14 +280,13 @@ bool NonMixBatchingScheduler::determineSchedulingStrategy(
     // Only one type available - schedule whatever is available
     if (contextRequests.empty())
     {
-        return false; // Only generation available
+        return false;
     }
     if (generationRequests.empty())
     {
-        return true; // Only context available
+        return true;
     }
 
-    // Both types available - implement alternating logic
     // Simply alternate: if last was context, schedule generation; if last was generation, schedule context
     return !mLastWasContext;
 }
@@ -340,7 +339,7 @@ RequestVector NonMixBatchingScheduler::scheduleRequests(RequestVector const& req
             && beneficialToSkip(req, kvCacheManager, crossKvCacheManager, newlyContributedContextBlocks,
                 newlyContributedCrossContextBlocks))
         {
-            continue; // Skip this request to wait for block reuse opportunity
+            continue;
         }
 
         // Check PEFT resource constraints
