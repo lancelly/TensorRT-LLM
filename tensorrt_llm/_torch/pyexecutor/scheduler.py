@@ -81,10 +81,11 @@ class BindCapacityScheduler(CapacityScheduler):
         super(BindCapacityScheduler, self).__init__()
         self.kv_cache_manager = kv_cache_manager
         self.peft_cache_manager = peft_cache_manager
+        self.scheduler_policy = tb_executor.CapacitySchedulerPolicy.NON_MIX_BATCHING
 
         self.impl = tb_internal.algorithms.CapacityScheduler(
             max_num_requests=max_num_requests,
-            capacity_scheduler_policy=scheduler_policy,
+            capacity_scheduler_policy=self.scheduler_policy,
             has_kv_cache_manager=kv_cache_manager is not None,
             two_step_lookahead=two_step_lookahead,
             no_schedule_until_state=LlmRequestState.CONTEXT_INIT,
@@ -206,6 +207,11 @@ class SimpleScheduler(RequestScheduler):
 
         context_requests, generation_requests = self.micro_batch_scheduler.schedule(
             fitting_requests, inflight_request_ids)
+
+        if self.capacity_scheduler.scheduler_policy == tb_executor.CapacitySchedulerPolicy.NON_MIX_BATCHING:
+            assert not (
+                len(context_requests) > 0 and len(generation_requests) > 0
+            ), "Non-mix batching scheduler should not schedule both context and generation requests."
         # Convert from binding type RequestVector to list[LlmRequest],
         # so Python fields on LlmRequest won't be stripped away
         return SchedulerOutput(list(context_requests),
