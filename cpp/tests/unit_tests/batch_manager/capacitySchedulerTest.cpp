@@ -12,6 +12,7 @@
 
 #include <gmock/gmock.h>
 #include <gtest/gtest.h>
+#include <map>
 
 #include "tensorrt_llm/batch_manager/capacityScheduler.h"
 #include "tensorrt_llm/batch_manager/common.h"
@@ -1883,62 +1884,68 @@ TEST_F(CapacitySchedulerTest, SimpleFitsStaticBatch)
 
 TEST_F(CapacitySchedulerTest, NonMixBatchingSchedulerNoMixing)
 {
-    SizeType32 kvCacheMaxNumTokens = 500;
+    SizeType32 kvCacheMaxNumTokens = 2000;      // Increased for more capacity
     SizeType32 kvCacheTokensPerBlock = 10;
-    SizeType32 kvCacheMaxNumTokensPerSeq = 90;
-    SizeType32 maxNumRequests = 6;
+    SizeType32 kvCacheMaxNumTokensPerSeq = 200; // Increased per sequence
+    SizeType32 maxNumRequests = 12;             // Increased to handle more requests
     SizeType32 maxInputLen = 1000;
 
-    auto kvCacheManager = getKvCacheManager(
-        maxNumRequests, kvCacheTokensPerBlock, kvCacheMaxNumTokens, kvCacheMaxNumTokensPerSeq, 0);
+    auto kvCacheManager
+        = getKvCacheManager(maxNumRequests, kvCacheTokensPerBlock, kvCacheMaxNumTokens, kvCacheMaxNumTokensPerSeq, 0);
     auto peftCacheManager = getPeftCacheManager();
     CapacitySchedulerPolicy capacitySchedulerPolicy = CapacitySchedulerPolicy::kNON_MIX_BATCHING;
     auto capacityScheduler = CapacityScheduler(maxNumRequests, capacitySchedulerPolicy, kvCacheManager != nullptr);
 
-    int32_t maxNewTokens = 10;
+    int32_t maxNewTokens = 5; // Reduced to slow down completion
     int32_t promptLen = 10;
 
-    // Create mixed requests: some in CONTEXT_INIT state, some in GENERATION_IN_PROGRESS state
+    // Create a larger pool of requests - ALL start as context requests
     RequestList activeRequests;
-    
-    // Add 3 context requests
-    activeRequests.push_back(createRequest(promptLen, maxNewTokens, 0, std::nullopt, 
-        tensorrt_llm::executor::Request::kDefaultPriority, LlmRequestState::kCONTEXT_INIT));
-    activeRequests.push_back(createRequest(promptLen, maxNewTokens, 1, std::nullopt, 
-        tensorrt_llm::executor::Request::kDefaultPriority, LlmRequestState::kCONTEXT_INIT));
-    activeRequests.push_back(createRequest(promptLen, maxNewTokens, 2, std::nullopt, 
-        tensorrt_llm::executor::Request::kDefaultPriority, LlmRequestState::kCONTEXT_INIT));
-    
-    // Add 3 generation requests
-    activeRequests.push_back(createRequest(promptLen, maxNewTokens, 3, std::nullopt, 
-        tensorrt_llm::executor::Request::kDefaultPriority, LlmRequestState::kGENERATION_IN_PROGRESS));
-    activeRequests.push_back(createRequest(promptLen, maxNewTokens, 4, std::nullopt, 
-        tensorrt_llm::executor::Request::kDefaultPriority, LlmRequestState::kGENERATION_IN_PROGRESS));
-    activeRequests.push_back(createRequest(promptLen, maxNewTokens, 5, std::nullopt, 
-        tensorrt_llm::executor::Request::kDefaultPriority, LlmRequestState::kGENERATION_IN_PROGRESS));
+    RequestList pendingRequests; // Requests to add later
 
-    // Set generation requests to have proper token counts (simulate they've been started)
-    activeRequests[3]->setContextCurrentPosition(promptLen);
-    activeRequests[3]->setDecodingIter(1);
-    activeRequests[4]->setContextCurrentPosition(promptLen);
-    activeRequests[4]->setDecodingIter(1);
-    activeRequests[5]->setContextCurrentPosition(promptLen);
-    activeRequests[5]->setDecodingIter(1);
+    // Add initial 4 context requests
+    for (int i = 0; i < 4; ++i)
+    {
+        activeRequests.push_back(createRequest(promptLen, maxNewTokens, i, std::nullopt,
+            tensorrt_llm::executor::Request::kDefaultPriority, LlmRequestState::kCONTEXT_INIT));
+    }
+
+    // Prepare additional context requests to add during iterations
+    for (int i = 4; i < 10; ++i)
+    {
+        pendingRequests.push_back(createRequest(promptLen, maxNewTokens, i, std::nullopt,
+            tensorrt_llm::executor::Request::kDefaultPriority, LlmRequestState::kCONTEXT_INIT));
+    }
 
     // Test multiple scheduling iterations to verify alternating behavior
     std::vector<std::string> schedulingPattern;
-    
-    for (int iteration = 0; iteration < 6 && !activeRequests.empty(); ++iteration)
+    int generationStepsRemaining = 0;               // Track how many generation steps each request needs
+    std::map<uint64_t, int> requestGenerationSteps; // Track generation steps per request
+
+    for (int iteration = 0; iteration < 12 && (!activeRequests.empty() || !pendingRequests.empty()); ++iteration)
     {
+        // Add new requests periodically to maintain diversity
+        if (iteration % 3 == 0 && !pendingRequests.empty())
+        {
+            activeRequests.push_back(pendingRequests.front());
+            pendingRequests.pop_front();
+        }
+
+        // Skip if no active requests
+        if (activeRequests.empty())
+        {
+            continue;
+        }
+
         auto [scheduledRequests, scheduledDisaggGenInitRequests, pausedRequests]
-            = capacityScheduler(activeRequests, kvCacheManager, peftCacheManager, nullptr);
+            = capacityScheduler(activeRequests, kvCacheManager, peftCacheManager, std::nullopt);
 
         EXPECT_FALSE(scheduledRequests.empty()) << "Should schedule some requests in iteration " << iteration;
-        
+
         // Verify batch purity: all requests in the same batch should have the same state type
         bool hasContextRequests = false;
         bool hasGenerationRequests = false;
-        
+
         for (auto const& req : scheduledRequests)
         {
             if (req->isContextInitState() || req->isDisaggGenerationInitState())
@@ -1950,12 +1957,12 @@ TEST_F(CapacitySchedulerTest, NonMixBatchingSchedulerNoMixing)
                 hasGenerationRequests = true;
             }
         }
-        
+
         // The key test: ensure no mixing in the same batch
-        EXPECT_FALSE(hasContextRequests && hasGenerationRequests) 
-            << "Batch mixing detected in iteration " << iteration 
+        EXPECT_FALSE(hasContextRequests && hasGenerationRequests)
+            << "Batch mixing detected in iteration " << iteration
             << " - found both context and generation requests in the same batch";
-        
+
         // Record the scheduling pattern for alternation verification
         if (hasContextRequests)
         {
@@ -1965,8 +1972,8 @@ TEST_F(CapacitySchedulerTest, NonMixBatchingSchedulerNoMixing)
         {
             schedulingPattern.push_back("GENERATION");
         }
-        
-        // Simulate request completion and removal
+
+        // Simulate request progression - slower completion
         for (auto& req : scheduledRequests)
         {
             if (req->isContextInitState())
@@ -1975,19 +1982,48 @@ TEST_F(CapacitySchedulerTest, NonMixBatchingSchedulerNoMixing)
                 req->setState(LlmRequestState::kGENERATION_IN_PROGRESS);
                 req->setContextCurrentPosition(promptLen);
                 req->setDecodingIter(1);
+                // Initialize generation steps needed
+                requestGenerationSteps[req->mRequestId] = maxNewTokens;
             }
             else if (req->isGenerationInProgressState())
             {
-                // Complete generation request
-                req->setState(LlmRequestState::kGENERATION_COMPLETE);
+                // Progress generation request by one step
+                auto reqId = req->mRequestId;
+                if (requestGenerationSteps.find(reqId) == requestGenerationSteps.end())
+                {
+                    requestGenerationSteps[reqId] = maxNewTokens;
+                }
+
+                requestGenerationSteps[reqId]--;
+                req->setDecodingIter(req->getDecodingIter() + 1);
+
+                // Complete only if all steps are done
+                if (requestGenerationSteps[reqId] <= 0)
+                {
+                    req->setState(LlmRequestState::kGENERATION_COMPLETE);
+                }
             }
         }
-        
-        // Remove completed requests
+
+        // Remove only completed requests
         activeRequests.erase(
             std::remove_if(activeRequests.begin(), activeRequests.end(),
-                [](const auto& req) { return req->getState() == LlmRequestState::kGENERATION_COMPLETE; }),
-            activeRequests.end()
-        );
+                [](auto const& req) { return req->getState() == LlmRequestState::kGENERATION_COMPLETE; }),
+            activeRequests.end());
     }
+
+    // Verify scheduling pattern shows correct non-mixing behavior
+    EXPECT_FALSE(schedulingPattern.empty()) << "Should have recorded some scheduling pattern";
+
+    // Verify first batch should be CONTEXT (context priority)
+    EXPECT_EQ(schedulingPattern[0], "CONTEXT") << "First batch should be context requests due to context priority";
+
+    // Verify we have both types in the pattern (comprehensive test)
+    bool hasContext
+        = std::find(schedulingPattern.begin(), schedulingPattern.end(), "CONTEXT") != schedulingPattern.end();
+    bool hasGeneration
+        = std::find(schedulingPattern.begin(), schedulingPattern.end(), "GENERATION") != schedulingPattern.end();
+
+    EXPECT_TRUE(hasContext) << "Scheduling pattern should include CONTEXT batches";
+    EXPECT_TRUE(hasGeneration) << "Scheduling pattern should include GENERATION batches";
 }

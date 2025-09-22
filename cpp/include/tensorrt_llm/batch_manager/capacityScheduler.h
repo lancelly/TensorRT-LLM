@@ -30,7 +30,7 @@ namespace kv_cache_manager
 class BaseKVCacheManager;
 struct BlockKey;
 struct BlockKeyHasher;
-}
+} // namespace kv_cache_manager
 class BasePeftCacheManager;
 } // namespace tensorrt_llm::batch_manager
 
@@ -167,25 +167,22 @@ private:
     [[nodiscard]] std::pair<RequestVector, RequestVector> categorizeRequests(RequestList const& activeRequests) const;
 
     /// @brief Determine which request type to schedule based on availability and alternating policy
-    [[nodiscard]] bool determineSchedulingStrategy(RequestVector const& contextRequests, RequestVector const& generationRequests) const;
+    [[nodiscard]] bool determineSchedulingStrategy(
+        RequestVector const& contextRequests, RequestVector const& generationRequests) const;
 
     /// @brief Schedule requests from the selected request type with resource management
-    [[nodiscard]] RequestVector scheduleRequests(
-        RequestVector const& requestsToSchedule,
-        bool shouldScheduleContext,
-        bool skippingIsRelevant,
-        kv_cache_manager::BaseKVCacheManager const& kvCacheManager,
+    [[nodiscard]] RequestVector scheduleRequests(RequestVector const& requestsToSchedule, bool shouldScheduleContext,
+        bool skippingIsRelevant, kv_cache_manager::BaseKVCacheManager const& kvCacheManager,
         OptionalRef<kv_cache_manager::BaseKVCacheManager const> crossKvCacheManager,
         OptionalRef<BasePeftCacheManager const> peftCacheManager,
         std::unordered_set<kv_cache_manager::BlockKey, kv_cache_manager::BlockKeyHasher>& newlyContributedContextBlocks,
-        std::unordered_set<kv_cache_manager::BlockKey, kv_cache_manager::BlockKeyHasher>& newlyContributedCrossContextBlocks) const;
+        std::unordered_set<kv_cache_manager::BlockKey, kv_cache_manager::BlockKeyHasher>&
+            newlyContributedCrossContextBlocks) const;
 
     /// @brief Check if PEFT resources are available for the request
     [[nodiscard]] bool checkPeftResources(std::shared_ptr<LlmRequest> const& req,
-        OptionalRef<BasePeftCacheManager const> peftCacheManager,
-        SizeType32 maxPeftCachePages,
-        SizeType32& claimedPeftPages,
-        std::unordered_set<uint64_t>& uniqTaskIds) const;
+        OptionalRef<BasePeftCacheManager const> peftCacheManager, SizeType32 maxPeftCachePages,
+        SizeType32& claimedPeftPages, std::unordered_set<uint64_t>& uniqTaskIds) const;
 };
 
 class CapacityScheduler : public Algorithm
