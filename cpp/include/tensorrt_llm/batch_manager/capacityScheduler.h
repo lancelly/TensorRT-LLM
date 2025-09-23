@@ -62,6 +62,29 @@ public:
         return mNoScheduleAfterState;
     }
 
+    /// @brief Check if a request should be skipped from scheduling
+    /// @param req The request to check
+    /// @param allowDisaggGeneration Allow disagg_generation_init requests to be scheduled
+    /// @return true if the request should be skipped, false otherwise
+    [[nodiscard]] bool shouldSkipRequest(
+        std::shared_ptr<LlmRequest> const& req, bool allowDisaggGeneration = true) const
+    {
+        // Check basic scheduling conditions first
+        bool basicSkipCondition
+            = !req->hasReachedState(getNoScheduleUntilState()) || req->hasReachedState(getNoScheduleAfterState());
+
+        if (allowDisaggGeneration)
+        {
+            // Allow disagg_generation_init requests to be scheduled, so they're excluded from the disagg check
+            return !req->isDisaggGenerationInitState() && basicSkipCondition;
+        }
+        else
+        {
+            // Don't make exception for disagg_generation_init requests
+            return basicSkipCondition;
+        }
+    }
+
 private:
     /// The state until/after which the scheduler should not schedule requests
     LlmRequestState mNoScheduleUntilState;

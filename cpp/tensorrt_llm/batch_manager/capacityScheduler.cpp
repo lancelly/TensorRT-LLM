@@ -165,7 +165,7 @@ std::tuple<RequestVector, RequestVector> MaxRequestsScheduler::operator()(Reques
     for (auto const& req : activeRequests)
     {
         // if request cannot be scheduled yet or request should no longer be scheduled, skip
-        if (!req->hasReachedState(getNoScheduleUntilState()) || req->hasReachedState(getNoScheduleAfterState()))
+        if (shouldSkipRequest(req, false))
         {
             continue;
         }
@@ -248,8 +248,8 @@ std::pair<RequestVector, RequestVector> NonMixBatchingScheduler::categorizeReque
 
     for (auto const& req : activeRequests)
     {
-        // Check if request can be scheduled
-        if (!req->hasReachedState(getNoScheduleUntilState()) || req->hasReachedState(getNoScheduleAfterState()))
+        // if request cannot be scheduled yet or request should no longer be scheduled, skip
+        if (shouldSkipRequest(req, true))
         {
             continue;
         }
@@ -291,26 +291,6 @@ bool NonMixBatchingScheduler::determineSchedulingStrategy(
     return !mLastWasContext;
 }
 
-bool NonMixBatchingScheduler::checkPeftResources(std::shared_ptr<LlmRequest> const& req,
-    OptionalRef<BasePeftCacheManager const> peftCacheManager, SizeType32 maxPeftCachePages,
-    SizeType32& claimedPeftPages, std::unordered_set<uint64_t>& uniqTaskIds) const
-{
-    bool reqHasLora = req->getLoraTaskId().has_value();
-    bool isNewTask = reqHasLora && !uniqTaskIds.count(req->getLoraTaskId().value());
-    auto neededPeftPages = isNewTask && peftCacheManager ? peftCacheManager->determineNumPages(req) : 0;
-
-    if (claimedPeftPages + neededPeftPages <= maxPeftCachePages)
-    {
-        claimedPeftPages += neededPeftPages;
-        if (isNewTask)
-        {
-            uniqTaskIds.insert(req->getLoraTaskId().value());
-        }
-        return true;
-    }
-    return false;
-}
-
 RequestVector NonMixBatchingScheduler::scheduleRequests(RequestVector const& requestsToSchedule,
     bool shouldScheduleContext, bool skippingIsRelevant, kv_cache_manager::BaseKVCacheManager const& kvCacheManager,
     OptionalRef<kv_cache_manager::BaseKVCacheManager const> crossKvCacheManager,
@@ -320,10 +300,15 @@ RequestVector NonMixBatchingScheduler::scheduleRequests(RequestVector const& req
 {
     RequestVector scheduledRequests;
 
-    // Resource management
+    // Resource management - KV cache blocks
+    auto reservedBlocks = kv_cache_manager::NoEvictScheduledBlocksManager(kvCacheManager);
+    auto reservedCrossBlocks = crossKvCacheManager
+        ? std::optional(kv_cache_manager::NoEvictScheduledBlocksManager(*crossKvCacheManager))
+        : std::nullopt;
+
+    // Resource management - PEFT cache
     auto const maxPeftCachePages
         = peftCacheManager ? peftCacheManager->getMaxDevicePages() : std::numeric_limits<SizeType32>::max();
-
     SizeType32 claimedPeftPages{0};
     std::unordered_set<uint64_t> uniqTaskIds{};
 
@@ -342,12 +327,39 @@ RequestVector NonMixBatchingScheduler::scheduleRequests(RequestVector const& req
             continue;
         }
 
+        // For now, we use the same resource management as GuaranteedNoEvictScheduler
+        // TODO: add resource management for NonMixBatchingScheduler
+
+        // Check KV cache block availability
+        bool enoughBlocks = reservedBlocks.enoughAvailableBlocks(*req);
+        bool enoughCrossBlocks = reservedCrossBlocks ? reservedCrossBlocks->enoughAvailableBlocks(*req) : true;
+
         // Check PEFT resource constraints
-        if (checkPeftResources(req, peftCacheManager, maxPeftCachePages, claimedPeftPages, uniqTaskIds))
+        bool reqHasLora = req->getLoraTaskId().has_value();
+        bool isNewTask = reqHasLora && !uniqTaskIds.count(req->getLoraTaskId().value());
+        auto neededPeftPages = isNewTask && peftCacheManager ? peftCacheManager->determineNumPages(req) : 0;
+        auto availablePeftPages = maxPeftCachePages - claimedPeftPages;
+
+        // Schedule request only if all resources are available
+        if (enoughBlocks && enoughCrossBlocks && (isNewTask ? neededPeftPages <= availablePeftPages : true))
         {
             scheduledRequests.emplace_back(req);
+
+            // Synchronously update all resource states
+            reservedBlocks.decrementReservedBlocks(*req);
+            if (reservedCrossBlocks)
+            {
+                reservedCrossBlocks->decrementReservedBlocks(*req);
+            }
+
+            // Update PEFT resource state
+            if (isNewTask)
+            {
+                claimedPeftPages += neededPeftPages;
+                uniqTaskIds.insert(req->getLoraTaskId().value());
+            }
         }
-        else
+        else if (!enoughBlocks || !enoughCrossBlocks)
         {
             // Resource insufficient, stop scheduling more requests of this type
             break;
@@ -409,10 +421,7 @@ std::tuple<RequestVector, RequestVector> GuaranteedNoEvictScheduler::impl(
     for (auto const& req : activeRequests)
     {
         // if request cannot be scheduled yet or request should no longer be scheduled, skip
-        if (
-            // Allow disagg_generation_init requests to be scheduled, so that we'll allocate their KV cache
-            !req->isDisaggGenerationInitState()
-            && (!req->hasReachedState(getNoScheduleUntilState()) || req->hasReachedState(getNoScheduleAfterState())))
+        if (shouldSkipRequest(req, true))
         {
             continue;
         }
@@ -545,10 +554,7 @@ std::tuple<RequestVector, RequestVector> MaxUtilizationScheduler::operator()(
         TLLM_LOG_DEBUG("MaxUtilizationScheduler: scheduling request ID %lu", req->mRequestId);
 
         // if request cannot be scheduled yet or request should no longer be scheduled, skip
-        if (
-            // Allow disagg_generation_init requests to be scheduled, so that we'll allocate their KV cache
-            !req->isDisaggGenerationInitState()
-            && (!req->hasReachedState(getNoScheduleUntilState()) || req->hasReachedState(getNoScheduleAfterState())))
+        if (shouldSkipRequest(req, true))
         {
             TLLM_LOG_DEBUG("MaxUtilizationScheduler: request ID %lu cannot / should not be scheduled", req->mRequestId);
             reqIt++;
