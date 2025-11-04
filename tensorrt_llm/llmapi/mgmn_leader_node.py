@@ -13,8 +13,21 @@ from tensorrt_llm.executor.utils import get_spawn_proxy_process_ipc_addr_env
 from tensorrt_llm.llmapi.mpi_session import RemoteMpiCommSessionServer
 from tensorrt_llm.llmapi.utils import logger_debug
 
+from ..logger import logger
+
 
 def launch_server_main(sub_comm=None):
+    # Initialize cached HuggingFace modules for models with trust_remote_code=True
+    # See: https://github.com/vllm-project/vllm/pull/871
+    try:
+        from transformers.dynamic_module_utils import init_hf_modules
+        init_hf_modules()
+        logger.info("[Leader] HF modules initialized successfully")
+    except ImportError as e:
+        logger.warning(f"[Leader] ImportError initializing HF modules: {e}")
+    except Exception as e:
+        logger.error(f"[Leader] Exception initializing HF modules: {e}")
+    
     num_ranks = sub_comm.Get_size() if sub_comm is not None else mpi_world_size(
     )
     logger_debug(f"Starting MPI Comm Server with {num_ranks} workers\n",
