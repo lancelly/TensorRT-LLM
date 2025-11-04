@@ -243,6 +243,14 @@ def worker_main(
     llm_args: Optional[BaseLlmArgs] = None,
 ) -> None:
     mpi_comm().barrier()
+    try:
+        from transformers.dynamic_module_utils import init_hf_modules
+        init_hf_modules()
+        logger.info("[Worker] HF modules initialized successfully")
+    except ImportError as e:
+        logger.warning(f"[Worker] ImportError initializing HF modules: {e}")
+    except Exception as e:
+        logger.error(f"[Worker] Exception initializing HF modules: {e}")
     logger_debug(f"Worker {mpi_rank()} entering worker_main...\n", "green")
 
     pid = os.getpid()
