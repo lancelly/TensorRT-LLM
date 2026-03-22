@@ -1329,6 +1329,8 @@ def create_py_executor_instance(
                             WaitingQueuePolicy.FCFS)
     sjf_config = (scheduler_config.sjf_config
                   if scheduler_config is not None else None)
+    ewsjf_config = (scheduler_config.ewsjf_config
+                    if scheduler_config is not None else None)
     return PyExecutor(
         resource_manager,
         scheduler,
@@ -1354,7 +1356,8 @@ def create_py_executor_instance(
         virtual_memory_pools=virtual_memory_pools,
         execution_stream=execution_stream,
         waiting_queue_policy=waiting_queue_policy,
-        sjf_config=sjf_config)
+        sjf_config=sjf_config,
+        ewsjf_config=ewsjf_config)
 
 
 def create_torch_sampler_args(

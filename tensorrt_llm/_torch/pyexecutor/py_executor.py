@@ -287,7 +287,8 @@ class PyExecutor:
             hang_detection_timeout: Optional[int] = None,
             execution_stream: Optional[torch.cuda.Stream] = None,
             waiting_queue_policy: WaitingQueuePolicy = WaitingQueuePolicy.FCFS,
-            sjf_config: Optional[SjfConfig] = None):
+            sjf_config: Optional[SjfConfig] = None,
+            ewsjf_config: Optional['EwsjfConfig'] = None):
         super(PyExecutor, self).__init__()
         self.device_id = torch.cuda.current_device()
         self.global_rank = dist.rank
@@ -503,7 +504,8 @@ class PyExecutor:
 
         # Waiting queue for requests that have been fetched but not yet scheduled
         self.waiting_queue: WaitingQueue = create_waiting_queue(
-            waiting_queue_policy, sjf_config=sjf_config)
+            waiting_queue_policy, sjf_config=sjf_config,
+            ewsjf_config=ewsjf_config)
 
         self.control_request_barrier = threading.Event()
         self.control_action_done = threading.Event()

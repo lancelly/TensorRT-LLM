@@ -1870,6 +1870,7 @@ class WaitingQueuePolicy(StrEnum):
 
     FCFS = "fcfs"  # First-Come-First-Served
     SJF = "sjf"  # Shortest-Job-First
+    EWSJF = "ewsjf"  # Exponentially Weighted SJF
 
 
 class SjfConfig(StrictBaseModel):
@@ -1903,6 +1904,57 @@ class SjfConfig(StrictBaseModel):
     time_weight: NonNegativeFloat = Field(
         default=0.5,
         description="Weight for the wait-time-based score component.")
+
+
+class EwsjfConfig(StrictBaseModel):
+    """Configuration for EWSJF (Exponentially Weighted SJF) scheduling.
+
+    Based on the EWSJF paper (arxiv 2601.21758). Partitions the waiting
+    queue into multiple length-based sub-queues, then uses density-weighted
+    scoring to select which sub-queue to pop from. This creates
+    performance-homogeneous batches and reduces head-of-line blocking.
+
+    The scoring formula for each sub-queue is:
+        score = qf * (w_base + w_urgency * cs + w_fairness * log(b + 1))
+
+    where:
+        qf = queue_priority / (b + 1)
+            Queue factor. queue_priority is higher for shorter-prompt
+            queues. This is the SJF heuristic at the queue level.
+        cs = wait_time / max(b, 1)
+            Compute score — wait time normalized by estimated prefill
+            cost. Short requests age faster than long ones.
+        log(b + 1) = fairness term
+            Prevents starvation. Grows without bound so long-waiting
+            requests eventually get served (Theorem A.1 in the paper).
+
+    The score is computed for the front (oldest) request in each sub-queue.
+    Within each sub-queue, requests are served FIFO.
+    """
+
+    queue_boundaries: Optional[list[PositiveInt]] = Field(
+        default=None,
+        description=
+        "Prompt length boundaries for sub-queue partitioning. Creates "
+        "len(boundaries)+1 sub-queues. E.g., [1024, 4096, 16384, 65536] "
+        "creates 5 queues: [0,1K), [1K,4K), [4K,16K), [16K,64K), [64K,inf). "
+        "If not provided, default geometric boundaries are used.")
+
+    w_base: NonNegativeFloat = Field(
+        default=1.0,
+        description="Base weight, ensures non-zero score even with no wait.")
+
+    w_urgency: NonNegativeFloat = Field(
+        default=1.0,
+        description=
+        "Weight for the cost-normalized aging term (cs). Higher values "
+        "make wait time more important relative to prompt length.")
+
+    w_fairness: NonNegativeFloat = Field(
+        default=0.5,
+        description=
+        "Weight for the logarithmic fairness term. Higher values reduce "
+        "starvation risk for long requests.")
 
 
 @PybindMirror.mirror_pybind_fields(_DynamicBatchConfig)
@@ -1959,16 +2011,27 @@ class SchedulerConfig(StrictBaseModel, PybindMirror):
         "Configuration for SJF waiting queue scheduling. Only used when "
         "waiting_queue_policy is 'sjf'. If not provided, defaults are used.")
 
+    ewsjf_config: Optional[EwsjfConfig] = Field(
+        default=None,
+        description=
+        "Configuration for EWSJF waiting queue scheduling. Only used when "
+        "waiting_queue_policy is 'ewsjf'. If not provided, defaults are used.")
+
     use_python_scheduler: bool = Field(
         default=False,
         description="Use pure-Python scheduler instead of C++ scheduler.")
 
     @model_validator(mode='after')
-    def validate_sjf_config(self) -> 'SchedulerConfig':
+    def validate_waiting_queue_config(self) -> 'SchedulerConfig':
         if (self.sjf_config is not None
                 and self.waiting_queue_policy != WaitingQueuePolicy.SJF):
             raise ValueError(
                 "sjf_config is only used when waiting_queue_policy is 'sjf'")
+        if (self.ewsjf_config is not None
+                and self.waiting_queue_policy != WaitingQueuePolicy.EWSJF):
+            raise ValueError(
+                "ewsjf_config is only used when "
+                "waiting_queue_policy is 'ewsjf'")
         return self
 
     def _to_pybind(self):
