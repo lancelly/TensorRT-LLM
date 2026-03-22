@@ -2013,6 +2013,30 @@ class EwsjfConfig(StrictBaseModel):
         description=
         "Intercept for context-aware fairness weight.")
 
+    # --- Component 3 (cont.): Prefill cost model & density ---
+    prefill_cost_coefficient: float = Field(
+        default=1.0,
+        gt=0.0,
+        description=
+        "C_prefill(b) = prefill_cost_coefficient * b^prefill_cost_exponent. "
+        "Models the compute cost of prefilling b tokens. The exponent "
+        "captures superlinear scaling from attention.")
+
+    prefill_cost_exponent: float = Field(
+        default=1.5,
+        gt=0.0,
+        description=
+        "Exponent in C_prefill(b) = coeff * b^exp. 1.0 = linear, "
+        "1.5 = superlinear (attention quadratic, but paged/chunked). "
+        "Updated by meta-optimizer based on observed prefill times.")
+
+    density_window_seconds: float = Field(
+        default=60.0,
+        gt=0.0,
+        description=
+        "Sliding window (seconds) for computing per-queue request "
+        "density ρ(q) = arrivals_in_window / window_size.")
+
     # --- Component 4: Bayesian Meta-Optimization ---
     meta_optimization_enabled: bool = Field(
         default=True,
@@ -2025,6 +2049,27 @@ class EwsjfConfig(StrictBaseModel):
         description=
         "How often (seconds) to run one trial of meta-optimization. "
         "Paper: 10-15 minutes per trial, converges in 5-8 trials.")
+
+    meta_optimization_max_trials: PositiveInt = Field(
+        default=20,
+        description=
+        "Maximum number of BO trials before freezing parameters. "
+        "Paper shows convergence in 5-8 trials; extra trials for "
+        "non-stationary workloads.")
+
+    gp_length_scale: float = Field(
+        default=1.0,
+        gt=0.0,
+        description=
+        "Initial length scale for the Gaussian Process RBF kernel "
+        "in Bayesian meta-optimization.")
+
+    gp_noise_variance: float = Field(
+        default=0.01,
+        gt=0.0,
+        description=
+        "Observation noise variance for the Gaussian Process. "
+        "Lower = trust observations more.")
 
     lambda_compactness: NonNegativeFloat = Field(
         default=1.0,
