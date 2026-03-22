@@ -1875,12 +1875,13 @@ class WaitingQueuePolicy(StrEnum):
 class SjfConfig(StrictBaseModel):
     """Configuration for SJF (Shortest Job First) waiting queue scheduling.
 
-    SJF prioritizes shorter requests while using wait-time aging to prevent
-    starvation of longer requests. The score is computed as:
+    SJF prioritizes shorter requests while using sigmoid-normalized aging to
+    prevent starvation of longer requests. The score is computed as:
         score = length_weight * length_score + time_weight * time_score
     where:
-        length_score = 1 / (1 + prompt_len / length_median)
-        time_score = wait_time / time_median
+        length_score = sigmoid(-(prompt_len - length_median) / length_median)
+        time_score   = sigmoid((wait_time - time_median) / time_median)
+    Both scores are mapped to (0, 1) via sigmoid normalization.
     """
 
     length_median: PositiveInt = Field(

@@ -14,6 +14,7 @@
 # limitations under the License.
 
 import itertools
+import math
 import time
 from abc import ABC, abstractmethod
 from collections import deque
@@ -134,10 +135,17 @@ class FCFSWaitingQueue(deque, WaitingQueue):
 class SJFWaitingQueue(WaitingQueue):
     """Shortest-Job-First waiting queue with wait-time aging.
 
-    Prioritizes shorter requests while using aging to prevent starvation.
+    Prioritizes shorter requests while using sigmoid-normalized aging to
+    prevent starvation. Uses the same algorithm as vLLM's SJF implementation.
+
     Score = length_weight * length_score + time_weight * time_score
-    where length_score = 1/(1 + prompt_len/length_median) and
-    time_score = wait_time/time_median.
+    where:
+        length_score = 1 / (1 + exp(norm_scale * (prompt_len - length_median)))
+        time_score   = 1 / (1 + exp(-norm_scale * (wait_time - time_median)))
+        norm_scale   = 1 / median  (for each dimension)
+
+    Both scores are sigmoid-normalized to (0, 1). Shorter prompts and longer
+    wait times yield higher scores.
 
     Internally maintains two lists:
     - _prepended: requests returned via prepend_request(s), served first
@@ -160,6 +168,14 @@ class SJFWaitingQueue(WaitingQueue):
             return arrival
         return self._arrival_times.get(item.id, now)
 
+    @staticmethod
+    def _sigmoid(x: float) -> float:
+        """Numerically stable sigmoid."""
+        if x >= 0:
+            return 1.0 / (1.0 + math.exp(-x))
+        exp_x = math.exp(x)
+        return exp_x / (1.0 + exp_x)
+
     def _compute_score(self, item: RequestQueueItem, now: float) -> float:
         prompt_len = (
             len(item.request.input_token_ids)
@@ -167,9 +183,20 @@ class SJFWaitingQueue(WaitingQueue):
             else 0
         )
         wait_time = max(0.0, now - self._get_arrival_time(item, now))
-        length_score = 1.0 / (1.0 + prompt_len / self._config.length_median)
-        time_score = wait_time / self._config.time_median
-        return self._config.length_weight * length_score + self._config.time_weight * time_score
+
+        # Sigmoid normalization (vLLM-style)
+        # Length: inverse sigmoid (shorter = higher score)
+        length_scale = 1.0 / self._config.length_median
+        length_score = self._sigmoid(
+            -length_scale * (prompt_len - self._config.length_median))
+
+        # Time: forward sigmoid (longer wait = higher score)
+        time_scale = 1.0 / self._config.time_median
+        time_score = self._sigmoid(
+            time_scale * (wait_time - self._config.time_median))
+
+        return (self._config.length_weight * length_score
+                + self._config.time_weight * time_score)
 
     def _ensure_sorted(self) -> None:
         if not self._sorted and self._requests:
