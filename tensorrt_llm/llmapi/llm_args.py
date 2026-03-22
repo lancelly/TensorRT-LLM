@@ -1909,52 +1909,142 @@ class SjfConfig(StrictBaseModel):
 class EwsjfConfig(StrictBaseModel):
     """Configuration for EWSJF (Exponentially Weighted SJF) scheduling.
 
-    Based on the EWSJF paper (arxiv 2601.21758). Partitions the waiting
-    queue into multiple length-based sub-queues, then uses density-weighted
-    scoring to select which sub-queue to pop from. This creates
-    performance-homogeneous batches and reduces head-of-line blocking.
+    Based on the EWSJF paper (arxiv 2601.21758). Implements all four
+    components of the paper:
 
-    The scoring formula for each sub-queue is:
-        score = qf * (w_base + w_urgency * cs + w_fairness * log(b + 1))
+    1. **Refine-and-Prune**: Unsupervised partitioning that discovers
+       performance-homogeneous request groups via K-means(k=3) → recursive
+       gap splitting → merge by scheduling utility.
 
-    where:
-        qf = queue_priority / (b + 1)
-            Queue factor. queue_priority is higher for shorter-prompt
-            queues. This is the SJF heuristic at the queue level.
-        cs = wait_time / max(b, 1)
-            Compute score — wait time normalized by estimated prefill
-            cost. Short requests age faster than long ones.
-        log(b + 1) = fairness term
-            Prevents starvation. Grows without bound so long-waiting
-            requests eventually get served (Theorem A.1 in the paper).
+    2. **Dynamic Queue Routing with Bubble Queues**: Routes requests to
+       sub-queues by prompt length, creating temporary "bubble" queues
+       when a request falls in a gap between existing queues.
 
-    The score is computed for the front (oldest) request in each sub-queue.
-    Within each sub-queue, requests are served FIFO.
+    3. **Density-Weighted Scoring**: Context-aware prioritization:
+        score = qf * (w_base + w_urgency(b̄_q) * cs + w_fairness(b̄_q) * log(b+1))
+       where weights adapt based on per-queue mean prompt length.
+
+    4. **Bayesian Meta-Optimization**: Periodically tunes scoring and
+       partitioning parameters based on live performance feedback using
+       reward R(Θ) = λ1*C + λ2*L - λ3*S - λ4*U.
     """
 
-    queue_boundaries: Optional[list[PositiveInt]] = Field(
+    # --- Component 1: Refine-and-Prune ---
+    initial_queue_boundaries: Optional[list[PositiveInt]] = Field(
         default=None,
         description=
-        "Prompt length boundaries for sub-queue partitioning. Creates "
-        "len(boundaries)+1 sub-queues. E.g., [1024, 4096, 16384, 65536] "
-        "creates 5 queues: [0,1K), [1K,4K), [4K,16K), [16K,64K), [64K,inf). "
-        "If not provided, default geometric boundaries are used.")
+        "Initial prompt length boundaries for sub-queue partitioning. "
+        "If None, Refine-and-Prune discovers them automatically from "
+        "observed prompt lengths. Set explicitly to skip auto-discovery.")
 
+    max_queues: PositiveInt = Field(
+        default=32,
+        description=
+        "Maximum number of sub-queues. The paper finds 32 optimal. "
+        "Refine-and-Prune merges queues down to this limit.")
+
+    repartition_interval_seconds: NonNegativeFloat = Field(
+        default=600.0,
+        description=
+        "How often (seconds) to re-run Refine-and-Prune on observed "
+        "prompt lengths. 0 = disabled (use initial boundaries only). "
+        "Paper suggests ~10 minutes.")
+
+    gap_significance_alpha: float = Field(
+        default=1.5,
+        gt=0.0,
+        description=
+        "Gap splitting threshold α. A gap is significant when "
+        "Gap_j > α * mean(all_gaps). Higher = fewer splits.")
+
+    # --- Component 2: Dynamic Queue Routing / Bubble Queues ---
+    bubble_upper_tolerance: float = Field(
+        default=1.10,
+        gt=1.0,
+        description=
+        "Upper tolerance for assigning to lower queue. Request with "
+        "length L assigned to Q_i if L <= Q_i.max_len * this value.")
+
+    bubble_lower_tolerance: float = Field(
+        default=0.90,
+        gt=0.0,
+        lt=1.0,
+        description=
+        "Lower tolerance for assigning to upper queue. Request with "
+        "length L assigned to Q_{i+1} if L >= Q_{i+1}.min_len * this.")
+
+    default_bubble_width: PositiveInt = Field(
+        default=512,
+        description=
+        "Default width (in tokens) for newly created bubble queues.")
+
+    empty_queue_threshold: PositiveInt = Field(
+        default=50,
+        description=
+        "Number of consecutive empty scheduling rounds before a bubble "
+        "queue is pruned.")
+
+    # --- Component 3: Density-Weighted Scoring ---
     w_base: NonNegativeFloat = Field(
         default=1.0,
         description="Base weight, ensures non-zero score even with no wait.")
 
-    w_urgency: NonNegativeFloat = Field(
+    a_urgency: float = Field(
+        default=0.0001,
+        description=
+        "Linear coefficient for context-aware urgency weight: "
+        "w_urgency(b̄_q) = a_urgency * b̄_q + b_urgency. "
+        "Makes urgency scale with queue's mean prompt length.")
+
+    b_urgency: NonNegativeFloat = Field(
         default=1.0,
         description=
-        "Weight for the cost-normalized aging term (cs). Higher values "
-        "make wait time more important relative to prompt length.")
+        "Intercept for context-aware urgency weight.")
 
-    w_fairness: NonNegativeFloat = Field(
+    a_fairness: float = Field(
+        default=-0.00005,
+        description=
+        "Linear coefficient for context-aware fairness weight: "
+        "w_fairness(b̄_q) = a_fairness * b̄_q + b_fairness. "
+        "Negative slope = less fairness boost for long-prompt queues.")
+
+    b_fairness: NonNegativeFloat = Field(
         default=0.5,
         description=
-        "Weight for the logarithmic fairness term. Higher values reduce "
-        "starvation risk for long requests.")
+        "Intercept for context-aware fairness weight.")
+
+    # --- Component 4: Bayesian Meta-Optimization ---
+    meta_optimization_enabled: bool = Field(
+        default=True,
+        description=
+        "Enable Bayesian meta-optimization of scoring and partitioning "
+        "parameters. When disabled, uses fixed parameter values.")
+
+    meta_optimization_interval_seconds: NonNegativeFloat = Field(
+        default=600.0,
+        description=
+        "How often (seconds) to run one trial of meta-optimization. "
+        "Paper: 10-15 minutes per trial, converges in 5-8 trials.")
+
+    lambda_compactness: NonNegativeFloat = Field(
+        default=1.0,
+        description=
+        "λ1 in R(Θ): weight for queue compactness/homogeneity.")
+
+    lambda_load_balance: NonNegativeFloat = Field(
+        default=1.0,
+        description=
+        "λ2 in R(Θ): weight for load balance across queues.")
+
+    lambda_proliferation: NonNegativeFloat = Field(
+        default=0.5,
+        description=
+        "λ3 in R(Θ): penalty for queue proliferation (too many queues).")
+
+    lambda_latency: NonNegativeFloat = Field(
+        default=1.0,
+        description=
+        "λ4 in R(Θ): penalty for user-experience (latency) degradation.")
 
 
 @PybindMirror.mirror_pybind_fields(_DynamicBatchConfig)

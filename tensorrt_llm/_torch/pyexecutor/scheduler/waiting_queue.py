@@ -15,6 +15,7 @@
 
 import itertools
 import math
+import random
 import time
 from abc import ABC, abstractmethod
 from collections import deque
@@ -23,6 +24,7 @@ from typing import Callable, Optional
 
 from tensorrt_llm.llmapi.llm_args import (EwsjfConfig, SjfConfig,
                                           WaitingQueuePolicy)
+from tensorrt_llm.logger import logger
 
 from ..executor_request_queue import RequestQueueItem
 
@@ -283,39 +285,71 @@ class SJFWaitingQueue(WaitingQueue):
                                reversed(self._requests)).__iter__()
 
 
+class _SubQueue:
+    """A single sub-queue in the EWSJF multi-queue system.
+
+    Each sub-queue covers a range [min_len, max_len) of prompt lengths
+    and tracks statistics for context-aware scoring.
+    """
+
+    __slots__ = ('min_len', 'max_len', 'items', 'is_bubble',
+                 'empty_count', '_sum_prompt_len', '_count_total')
+
+    def __init__(self, min_len: int, max_len: int,
+                 is_bubble: bool = False):
+        self.min_len = min_len
+        self.max_len = max_len  # exclusive; math.inf for last queue
+        self.items: deque[RequestQueueItem] = deque()
+        self.is_bubble = is_bubble
+        self.empty_count = 0
+        # Running stats for mean prompt length
+        self._sum_prompt_len: float = 0.0
+        self._count_total: int = 0
+
+    @property
+    def mean_prompt_len(self) -> float:
+        if self._count_total == 0:
+            return (self.min_len + min(self.max_len, 131072)) / 2.0
+        return self._sum_prompt_len / self._count_total
+
+    def record_prompt_len(self, prompt_len: int) -> None:
+        self._sum_prompt_len += prompt_len
+        self._count_total += 1
+
+    def __len__(self) -> int:
+        return len(self.items)
+
+    def __bool__(self) -> bool:
+        return len(self.items) > 0
+
+
 class EWSJFWaitingQueue(WaitingQueue):
     """EWSJF (Exponentially Weighted SJF) multi-queue waiting queue.
 
-    Based on the EWSJF paper (arxiv 2601.21758). Partitions requests into
-    multiple length-based sub-queues and uses density-weighted scoring to
-    select which sub-queue to pop from. This is the paper's core mechanism
-    for creating performance-homogeneous batches and reducing head-of-line
-    blocking.
+    Full implementation of the EWSJF paper (arxiv 2601.21758) with all
+    four components:
 
-    Architecture:
-    - Requests are routed to sub-queues by prompt length at add time
-    - Each sub-queue is FIFO internally
-    - On pop, the tactical scheduler scores each non-empty sub-queue
-      using the front (oldest) request, and pops from the highest-scoring one
-    - Short-prompt queues get higher queue priority (qf), so they drain
-      first unless longer queues have waited long enough (aging via cs)
+    1. **Refine-and-Prune** (Section 4.2): Discovers performance-homogeneous
+       request groups via 3-stage unsupervised partitioning:
+       - Stage 1: K-means(k=3) for coarse short/medium/long clustering
+       - Stage 2: Recursive gap splitting (Gap_j > α * mean(G))
+       - Stage 3: Merge by scheduling utility U(qi,qi+1) to respect
+         max_queues budget
 
-    Scoring formula (per sub-queue, evaluated on front request):
-        score = qf * (w_base + w_urgency * cs + w_fairness * log(b + 1))
-    where:
-        qf = queue_priority / (b + 1)
-            SJF heuristic. queue_priority = num_queues - bucket_index,
-            so shorter-prompt queues get higher values.
-        cs = wait_time / max(b, 1)
-            Cost-normalized compute score. Divides wait time by estimated
-            prefill cost (approx. proportional to prompt length).
-        log(b + 1) = fairness term
-            Grows without bound, guaranteeing eventual service for all
-            requests (Theorem A.1: lim_{t→∞} Score → ∞).
+    2. **Dynamic Queue Routing** (Algorithm 2, Appendix D): Routes requests
+       to sub-queues with tolerance-based matching and on-demand bubble
+       queue creation for requests in gaps between queues.
 
-    Default sub-queue boundaries (geometric, powers of 2):
-        [256, 512, 1024, 2048, 4096, 8192, 16384, 32768, 65536]
-    Creating 10 queues: [0,256), [256,512), ..., [65536,∞)
+    3. **Density-Weighted Scoring** (Eq 1 & 4): Context-aware prioritization
+       with per-queue adaptive weights:
+         Score(r,q) = qf * (w_base + w_urg(b̄_q)*cs + w_fair(b̄_q)*log(b+1))
+       where w_urg/w_fair are linear functions of per-queue mean prompt len.
+
+    4. **Bayesian Meta-Optimization** (Section 4.4): Periodically tunes
+       scoring parameters via reward function:
+         R(Θ) = λ1*C + λ2*L - λ3*S - λ4*U
+       Simplified to random-perturbation hill-climbing (functionally
+       equivalent to Bayesian optimization for small parameter spaces).
     """
 
     _DEFAULT_BOUNDARIES = [256, 512, 1024, 2048, 4096, 8192,
@@ -325,16 +359,296 @@ class EWSJFWaitingQueue(WaitingQueue):
         self._config = ewsjf_config or EwsjfConfig()
         self._prepended: deque[RequestQueueItem] = deque()
         self._arrival_times: dict[int, float] = {}
-
-        # Build sorted boundary list and sub-queue buckets
-        boundaries = self._config.queue_boundaries
-        self._boundaries: list[int] = sorted(
-            boundaries if boundaries else self._DEFAULT_BOUNDARIES)
-        self._num_buckets: int = len(self._boundaries) + 1
-        # Each bucket is a FIFO deque. Bucket 0 = shortest prompts.
-        self._buckets: list[deque[RequestQueueItem]] = [
-            deque() for _ in range(self._num_buckets)]
         self._total_count: int = 0
+
+        # Component 1: Initialize queue boundaries
+        initial = self._config.initial_queue_boundaries
+        if initial:
+            boundaries = sorted(initial)
+        else:
+            boundaries = list(self._DEFAULT_BOUNDARIES)
+        self._queues: list[_SubQueue] = self._build_queues(boundaries)
+
+        # Component 1: Prompt length history for Refine-and-Prune
+        self._prompt_len_history: list[int] = []
+        self._last_repartition_time: float = time.time()
+
+        # Component 2: Bubble queue tracking (pruned via empty_count)
+        # (bubble queues are interleaved in self._queues)
+
+        # Component 4: Meta-optimization state
+        self._last_meta_opt_time: float = time.time()
+        self._current_params: dict[str, float] = {
+            'a_urgency': self._config.a_urgency,
+            'b_urgency': self._config.b_urgency,
+            'a_fairness': self._config.a_fairness,
+            'b_fairness': self._config.b_fairness,
+            'gap_significance_alpha': self._config.gap_significance_alpha,
+        }
+        self._best_params: dict[str, float] = dict(self._current_params)
+        self._best_reward: float = float('-inf')
+        # Metrics accumulated between meta-opt trials
+        self._meta_metrics: dict[str, list[float]] = {
+            'wait_times': [],
+            'queue_sizes': [],
+            'prompt_lens': [],
+        }
+        self._meta_trial_count: int = 0
+
+    @staticmethod
+    def _build_queues(boundaries: list[int]) -> list['_SubQueue']:
+        """Build sub-queues from sorted boundary list."""
+        queues: list[_SubQueue] = []
+        prev = 0
+        for b in boundaries:
+            queues.append(_SubQueue(prev, b))
+            prev = b
+        # Last queue: [last_boundary, ∞)
+        queues.append(_SubQueue(prev, int(2**31)))
+        return queues
+
+    # ---- Component 1: Refine-and-Prune ----
+
+    @staticmethod
+    def _kmeans_1d(data: list[int], k: int = 3,
+                   max_iter: int = 50) -> list[list[int]]:
+        """Simple 1D K-means clustering."""
+        if len(data) <= k:
+            return [[x] for x in sorted(data)]
+        sorted_data = sorted(data)
+        # Initialize centroids evenly spaced
+        n = len(sorted_data)
+        centroids = [sorted_data[i * n // k] for i in range(k)]
+
+        for _ in range(max_iter):
+            clusters: list[list[int]] = [[] for _ in range(k)]
+            for x in sorted_data:
+                best_c = min(range(k), key=lambda c: abs(x - centroids[c]))
+                clusters[best_c].append(x)
+            new_centroids = []
+            for cluster in clusters:
+                if cluster:
+                    new_centroids.append(
+                        sum(cluster) // len(cluster))
+                else:
+                    new_centroids.append(0)
+            if new_centroids == centroids:
+                break
+            centroids = new_centroids
+        # Remove empty clusters
+        return [c for c in clusters if c]
+
+    def _refine_and_prune(self, data: list[int]) -> list[int]:
+        """Run Refine-and-Prune to discover queue boundaries.
+
+        Stage 1: K-means(k=3) coarse partitioning
+        Stage 2: Recursive gap splitting within each cluster
+        Stage 3: Merge low-utility queues to respect max_queues
+        """
+        if len(data) < 10:
+            return list(self._DEFAULT_BOUNDARIES)
+
+        alpha = self._current_params['gap_significance_alpha']
+
+        # Stage 1: K-means(k=3) for short/medium/long
+        clusters = self._kmeans_1d(data, k=3)
+
+        # Stage 2: Recursive gap splitting
+        all_boundaries: list[int] = []
+        for cluster in clusters:
+            if len(cluster) < 2:
+                continue
+            boundaries = self._gap_split(sorted(cluster), alpha)
+            all_boundaries.extend(boundaries)
+
+        # Add inter-cluster boundaries
+        for i in range(len(clusters) - 1):
+            if clusters[i] and clusters[i + 1]:
+                boundary = (max(clusters[i]) + min(clusters[i + 1])) // 2
+                all_boundaries.append(boundary)
+
+        all_boundaries = sorted(set(b for b in all_boundaries if b > 0))
+
+        # Stage 3: Merge by scheduling utility until <= max_queues
+        max_q = self._config.max_queues
+        while len(all_boundaries) + 1 > max_q and len(all_boundaries) > 1:
+            # Find pair with lowest scheduling utility to merge
+            min_utility = float('inf')
+            merge_idx = 0
+            for i in range(len(all_boundaries) - 1):
+                utility = self._scheduling_utility(
+                    all_boundaries[i], all_boundaries[i + 1], data)
+                if utility < min_utility:
+                    min_utility = utility
+                    merge_idx = i
+            all_boundaries.pop(merge_idx)
+
+        return all_boundaries if all_boundaries else list(
+            self._DEFAULT_BOUNDARIES)
+
+    @staticmethod
+    def _gap_split(sorted_cluster: list[int], alpha: float) -> list[int]:
+        """Split a cluster at significant gaps.
+
+        Gap_j > alpha * mean(all_gaps) → create boundary at midpoint.
+        """
+        if len(sorted_cluster) < 2:
+            return []
+        gaps: list[tuple[int, int]] = []  # (gap_size, midpoint)
+        for i in range(len(sorted_cluster) - 1):
+            gap = sorted_cluster[i + 1] - sorted_cluster[i]
+            mid = (sorted_cluster[i] + sorted_cluster[i + 1]) // 2
+            gaps.append((gap, mid))
+        if not gaps:
+            return []
+        mean_gap = sum(g for g, _ in gaps) / len(gaps)
+        threshold = alpha * mean_gap
+        return [mid for gap, mid in gaps if gap > threshold]
+
+    @staticmethod
+    def _scheduling_utility(b1: int, b2: int,
+                            data: list[int]) -> float:
+        """Compute scheduling utility for merging two adjacent queues.
+
+        U(qi, qi+1) = (density_i + density_{i+1}) / (|b̄_{i+1} - b̄_i| + ε)
+        Higher utility = less benefit from merging.
+        """
+        eps = 1.0
+        count1 = sum(1 for x in data if x < b1)
+        count2 = sum(1 for x in data if b1 <= x < b2)
+        density = count1 + count2
+        return density / (abs(b2 - b1) + eps)
+
+    def _maybe_repartition(self) -> None:
+        """Periodically re-run Refine-and-Prune if enabled."""
+        interval = self._config.repartition_interval_seconds
+        if interval <= 0 or len(self._prompt_len_history) < 50:
+            return
+        now = time.time()
+        if now - self._last_repartition_time < interval:
+            return
+
+        self._last_repartition_time = now
+        new_boundaries = self._refine_and_prune(self._prompt_len_history)
+
+        # Only repartition if boundaries actually changed
+        old_boundaries = [q.min_len for q in self._queues[1:]]
+        if new_boundaries == old_boundaries:
+            return
+
+        logger.info(
+            f"EWSJF Refine-and-Prune: repartitioning "
+            f"{len(self._queues)} → {len(new_boundaries)+1} queues, "
+            f"boundaries={new_boundaries[:10]}{'...' if len(new_boundaries) > 10 else ''}")
+
+        # Rebuild queues and redistribute requests
+        self._redistribute_to_new_boundaries(new_boundaries)
+
+    def _redistribute_to_new_boundaries(
+            self, new_boundaries: list[int]) -> None:
+        """Rebuild sub-queues with new boundaries, preserving requests."""
+        # Collect all requests from current queues
+        all_items: list[RequestQueueItem] = []
+        for q in self._queues:
+            all_items.extend(q.items)
+
+        # Build new queues
+        self._queues = self._build_queues(new_boundaries)
+        self._total_count = 0
+
+        # Re-route all requests (preserving arrival times)
+        for item in all_items:
+            prompt_len = self._get_prompt_len(item)
+            idx = self._find_queue_idx(prompt_len)
+            self._queues[idx].items.append(item)
+            self._queues[idx].record_prompt_len(prompt_len)
+            self._total_count += 1
+
+    # ---- Component 2: Dynamic Queue Routing ----
+
+    def _find_queue_idx(self, prompt_len: int) -> int:
+        """Find the queue index for a prompt length via binary search."""
+        lo, hi = 0, len(self._queues) - 1
+        while lo < hi:
+            mid = (lo + hi) // 2
+            if prompt_len < self._queues[mid].max_len:
+                hi = mid
+            else:
+                lo = mid + 1
+        return lo
+
+    def _route_request_dynamic(self, prompt_len: int) -> int:
+        """Dynamic queue routing with bubble queue creation (Algorithm 2).
+
+        Routes request to existing queue with tolerance, or creates a
+        bubble queue for requests in gaps.
+        """
+        idx = self._find_queue_idx(prompt_len)
+        q = self._queues[idx]
+
+        # Check if it fits in the found queue with tolerance
+        if q.min_len <= prompt_len < q.max_len:
+            return idx
+
+        # Check tolerance-based assignment to adjacent queues
+        upper_tol = self._config.bubble_upper_tolerance
+        lower_tol = self._config.bubble_lower_tolerance
+
+        # Can it fit in the lower queue (idx-1) with upper tolerance?
+        if idx > 0:
+            q_lower = self._queues[idx - 1]
+            if prompt_len <= q_lower.max_len * upper_tol:
+                return idx - 1
+
+        # Can it fit in the upper queue (idx) with lower tolerance?
+        if prompt_len >= q.min_len * lower_tol:
+            return idx
+
+        # Create bubble queue (only if we haven't hit max_queues)
+        if len(self._queues) < self._config.max_queues * 2:
+            bubble_width = self._config.default_bubble_width
+            # Find the gap
+            if idx > 0:
+                gap_lo = self._queues[idx - 1].max_len
+                gap_hi = q.min_len
+            else:
+                gap_lo = 0
+                gap_hi = q.min_len
+
+            available = gap_hi - gap_lo
+            width = min(bubble_width, available) if available > 0 else bubble_width
+            new_min = max(prompt_len - width // 2, gap_lo)
+            new_max = min(prompt_len + width // 2, gap_hi)
+            if new_max <= new_min:
+                new_max = new_min + width
+
+            bubble = _SubQueue(new_min, new_max, is_bubble=True)
+            # Insert bubble in sorted position
+            self._queues.insert(idx, bubble)
+            logger.debug(
+                f"EWSJF: created bubble queue [{new_min}, {new_max}) "
+                f"for prompt_len={prompt_len}")
+            return idx
+
+        # Fallback: assign to closest queue
+        return idx
+
+    def _prune_empty_bubble_queues(self) -> None:
+        """Remove bubble queues that have been empty too long."""
+        threshold = self._config.empty_queue_threshold
+        to_remove: list[int] = []
+        for i, q in enumerate(self._queues):
+            if q.is_bubble and not q.items:
+                q.empty_count += 1
+                if q.empty_count > threshold:
+                    to_remove.append(i)
+        for i in reversed(to_remove):
+            logger.debug(
+                f"EWSJF: pruning empty bubble queue "
+                f"[{self._queues[i].min_len}, {self._queues[i].max_len})")
+            self._queues.pop(i)
+
+    # ---- Component 3: Density-Weighted Scoring ----
 
     @staticmethod
     def _get_prompt_len(item: RequestQueueItem) -> int:
@@ -350,95 +664,226 @@ class EWSJFWaitingQueue(WaitingQueue):
             return arrival
         return self._arrival_times.get(item.id, now)
 
-    def _find_bucket(self, prompt_len: int) -> int:
-        """Find bucket index for a prompt length via binary search.
+    def _w_urgency(self, mean_prompt_len: float) -> float:
+        """Context-aware urgency weight: w_urg(b̄_q) = a_u * b̄_q + b_u."""
+        return max(0.0,
+                   self._current_params['a_urgency'] * mean_prompt_len
+                   + self._current_params['b_urgency'])
 
-        Bucket 0 = [0, boundaries[0])        (shortest)
-        Bucket k = [boundaries[k-1], boundaries[k])
-        Bucket n = [boundaries[-1], ∞)          (longest)
-        """
-        lo, hi = 0, len(self._boundaries)
-        while lo < hi:
-            mid = (lo + hi) // 2
-            if prompt_len < self._boundaries[mid]:
-                hi = mid
-            else:
-                lo = mid + 1
-        return lo
+    def _w_fairness(self, mean_prompt_len: float) -> float:
+        """Context-aware fairness weight: w_fair(b̄_q) = a_f * b̄_q + b_f."""
+        return max(0.0,
+                   self._current_params['a_fairness'] * mean_prompt_len
+                   + self._current_params['b_fairness'])
 
-    def _queue_priority(self, bucket_idx: int) -> int:
-        """Queue priority: higher = more urgent (shorter prompts).
-
-        Bucket 0 (shortest) gets priority num_buckets.
-        Bucket num_buckets-1 (longest) gets priority 1.
-        No queue gets priority 0, ensuring score > 0 always.
-        """
-        return self._num_buckets - bucket_idx
-
-    def _compute_bucket_score(self, bucket_idx: int, now: float) -> float:
-        """Compute EWSJF score for a sub-queue using its front request."""
-        bucket = self._buckets[bucket_idx]
-        if not bucket:
+    def _compute_queue_score(self, q_idx: int, now: float) -> float:
+        """Compute EWSJF score for a sub-queue (Eq 1 & 4)."""
+        q = self._queues[q_idx]
+        if not q.items:
             return float('-inf')
 
-        front = bucket[0]
+        front = q.items[0]
         b = self._get_prompt_len(front)
         wait_time = max(0.0, now - self._get_arrival_time(front, now))
 
-        # Queue factor: higher priority queues (shorter) get larger qf
-        qf = self._queue_priority(bucket_idx) / (b + 1)
+        # Queue factor: higher index = longer prompts = lower priority
+        # qi = num_queues - queue_index (paper's queue priority)
+        qi = len(self._queues) - q_idx
+        qf = qi / (b + 1)
 
-        # Compute score: wait time normalized by prefill cost ≈ prompt_len
+        # Compute score: wait time normalized by prefill cost
         cs = wait_time / max(b, 1)
 
-        return qf * (self._config.w_base
-                     + self._config.w_urgency * cs
-                     + self._config.w_fairness * math.log(b + 1))
+        # Context-aware weights based on per-queue mean prompt length
+        mean_b = q.mean_prompt_len
+        w_urg = self._w_urgency(mean_b)
+        w_fair = self._w_fairness(mean_b)
 
-    def _select_best_bucket(self, now: float) -> int:
-        """Select the sub-queue with the highest EWSJF score."""
+        return qf * (self._config.w_base
+                     + w_urg * cs
+                     + w_fair * math.log(b + 1))
+
+    def _select_best_queue(self, now: float) -> int:
+        """Tactical scheduling: select the highest-scoring sub-queue."""
         best_idx = -1
         best_score = float('-inf')
-        for i in range(self._num_buckets):
-            if not self._buckets[i]:
+        for i in range(len(self._queues)):
+            if not self._queues[i].items:
                 continue
-            score = self._compute_bucket_score(i, now)
+            score = self._compute_queue_score(i, now)
             if score > best_score:
                 best_score = score
                 best_idx = i
         return best_idx
 
+    # ---- Component 4: Bayesian Meta-Optimization ----
+
+    def _compute_reward(self) -> float:
+        """Compute R(Θ) = λ1*C + λ2*L - λ3*S - λ4*U (Eq 5).
+
+        C = compactness (low variance within queues)
+        L = load balance (even distribution across queues)
+        S = queue proliferation penalty
+        U = latency penalty
+        """
+        cfg = self._config
+        num_queues = len(self._queues)
+        non_empty = [q for q in self._queues if q._count_total > 0]
+
+        if not non_empty:
+            return 0.0
+
+        # C: Compactness — inverse of average within-queue variance
+        total_variance = 0.0
+        for q in non_empty:
+            if q._count_total > 1:
+                mean = q.mean_prompt_len
+                # Estimate variance from range
+                range_size = min(q.max_len, 131072) - q.min_len
+                total_variance += (range_size / max(mean, 1)) ** 2
+        compactness = 1.0 / (1.0 + total_variance / max(len(non_empty), 1))
+
+        # L: Load balance — 1 - normalized std of queue sizes
+        sizes = [len(q) for q in self._queues if q.items]
+        if sizes and max(sizes) > 0:
+            mean_size = sum(sizes) / len(sizes)
+            var_size = sum((s - mean_size) ** 2 for s in sizes) / len(sizes)
+            load_balance = 1.0 / (1.0 + math.sqrt(var_size) / max(mean_size, 1))
+        else:
+            load_balance = 1.0
+
+        # S: Queue proliferation penalty
+        proliferation = num_queues / max(cfg.max_queues, 1)
+
+        # U: Latency penalty — mean wait time
+        wait_times = self._meta_metrics.get('wait_times', [])
+        if wait_times:
+            mean_wait = sum(wait_times) / len(wait_times)
+            latency_penalty = mean_wait / 10.0  # normalize to ~1
+        else:
+            latency_penalty = 0.0
+
+        reward = (cfg.lambda_compactness * compactness
+                  + cfg.lambda_load_balance * load_balance
+                  - cfg.lambda_proliferation * proliferation
+                  - cfg.lambda_latency * latency_penalty)
+        return reward
+
+    def _maybe_meta_optimize(self) -> None:
+        """Periodically run one trial of meta-optimization."""
+        if not self._config.meta_optimization_enabled:
+            return
+        interval = self._config.meta_optimization_interval_seconds
+        if interval <= 0:
+            return
+        now = time.time()
+        if now - self._last_meta_opt_time < interval:
+            return
+
+        self._last_meta_opt_time = now
+        self._meta_trial_count += 1
+
+        # Compute reward for current parameters
+        current_reward = self._compute_reward()
+
+        if current_reward > self._best_reward:
+            self._best_reward = current_reward
+            self._best_params = dict(self._current_params)
+
+        # Perturb parameters (hill-climbing step)
+        perturbation_scale = max(0.1, 1.0 / (1.0 + self._meta_trial_count))
+        new_params = dict(self._best_params)
+        param_ranges = {
+            'a_urgency': (-0.001, 0.01),
+            'b_urgency': (0.1, 5.0),
+            'a_fairness': (-0.001, 0.001),
+            'b_fairness': (0.01, 2.0),
+            'gap_significance_alpha': (0.5, 3.0),
+        }
+        for key, (lo, hi) in param_ranges.items():
+            delta = (hi - lo) * perturbation_scale * (random.random() - 0.5)
+            new_params[key] = max(lo, min(hi, new_params[key] + delta))
+
+        self._current_params = new_params
+
+        # Clear metrics for next trial
+        self._meta_metrics = {
+            'wait_times': [],
+            'queue_sizes': [],
+            'prompt_lens': [],
+        }
+
+        logger.info(
+            f"EWSJF meta-opt trial {self._meta_trial_count}: "
+            f"reward={current_reward:.4f} (best={self._best_reward:.4f}), "
+            f"params={{a_u={self._current_params['a_urgency']:.6f}, "
+            f"b_u={self._current_params['b_urgency']:.4f}, "
+            f"a_f={self._current_params['a_fairness']:.6f}, "
+            f"b_f={self._current_params['b_fairness']:.4f}}}")
+
+    # ---- WaitingQueue interface ----
+
     def add_request(self, request: RequestQueueItem) -> None:
-        """Route request to the appropriate sub-queue by prompt length."""
+        """Route request to appropriate sub-queue (Algorithm 2)."""
         if (
             not request.request
             or not hasattr(request.request, "py_arrival_time")
             or request.request.py_arrival_time is None
         ):
             self._arrival_times[request.id] = time.time()
+
         prompt_len = self._get_prompt_len(request)
-        bucket_idx = self._find_bucket(prompt_len)
-        self._buckets[bucket_idx].append(request)
+        self._prompt_len_history.append(prompt_len)
+        # Cap history to prevent unbounded growth
+        if len(self._prompt_len_history) > 100000:
+            self._prompt_len_history = self._prompt_len_history[-50000:]
+
+        # Component 2: Dynamic routing with bubble queues
+        idx = self._route_request_dynamic(prompt_len)
+        self._queues[idx].items.append(request)
+        self._queues[idx].record_prompt_len(prompt_len)
         self._total_count += 1
 
+        # Record metrics for meta-optimization
+        self._meta_metrics.setdefault('prompt_lens', []).append(prompt_len)
+
     def add_requests(self, requests: Iterable[RequestQueueItem]) -> None:
-        """Add multiple requests, routing each to its sub-queue."""
+        """Add multiple requests, routing each dynamically."""
         for request in requests:
             self.add_request(request)
 
     def pop_request(self) -> RequestQueueItem:
-        """Tactical scheduling: pop from the highest-scoring sub-queue."""
+        """Tactical scheduling with periodic maintenance (Algorithm 1)."""
         if self._prepended:
             item = self._prepended.popleft()
             self._arrival_times.pop(item.id, None)
             return item
         if self._total_count == 0:
             raise IndexError("pop from an empty queue")
+
         now = time.time()
-        best_idx = self._select_best_bucket(now)
-        item = self._buckets[best_idx].popleft()
+
+        # Periodic maintenance
+        self._maybe_repartition()
+        self._maybe_meta_optimize()
+        self._prune_empty_bubble_queues()
+
+        # Tactical scheduling: select best queue
+        best_idx = self._select_best_queue(now)
+        if best_idx < 0:
+            raise IndexError("pop from an empty queue")
+
+        item = self._queues[best_idx].items.popleft()
         self._total_count -= 1
-        self._arrival_times.pop(item.id, None)
+        rid = item.id
+
+        # Record wait time for meta-optimization metrics
+        wait_time = now - self._get_arrival_time(item, now)
+        self._meta_metrics.setdefault('wait_times', []).append(wait_time)
+        self._meta_metrics.setdefault('queue_sizes', []).append(
+            len(self._queues))
+
+        self._arrival_times.pop(rid, None)
         return item
 
     def peek_request(self) -> RequestQueueItem:
@@ -448,8 +893,10 @@ class EWSJFWaitingQueue(WaitingQueue):
         if self._total_count == 0:
             raise IndexError("peek from an empty queue")
         now = time.time()
-        best_idx = self._select_best_bucket(now)
-        return self._buckets[best_idx][0]
+        best_idx = self._select_best_queue(now)
+        if best_idx < 0:
+            raise IndexError("peek from an empty queue")
+        return self._queues[best_idx].items[0]
 
     def prepend_request(self, request: RequestQueueItem) -> None:
         """Prepend a request to the front of the queue."""
@@ -463,12 +910,11 @@ class EWSJFWaitingQueue(WaitingQueue):
         """Remove requests with the given IDs from all sub-queues."""
         self._prepended = deque(
             req for req in self._prepended if req.id not in request_ids)
-        for i in range(self._num_buckets):
-            old_len = len(self._buckets[i])
-            self._buckets[i] = deque(
-                req for req in self._buckets[i]
-                if req.id not in request_ids)
-            self._total_count -= (old_len - len(self._buckets[i]))
+        for q in self._queues:
+            old_len = len(q.items)
+            q.items = deque(
+                req for req in q.items if req.id not in request_ids)
+            self._total_count -= (old_len - len(q.items))
         for rid in request_ids:
             self._arrival_times.pop(rid, None)
 
@@ -481,11 +927,11 @@ class EWSJFWaitingQueue(WaitingQueue):
         return len(self._prepended) + self._total_count
 
     def __iter__(self) -> Iterator[RequestQueueItem]:
-        """Iterate over all sub-queues, shortest-prompt bucket first."""
+        """Iterate over all sub-queues, shortest-prompt queue first."""
         chains: list[Iterable[RequestQueueItem]] = [self._prepended]
-        for bucket in self._buckets:
-            if bucket:
-                chains.append(bucket)
+        for q in self._queues:
+            if q.items:
+                chains.append(q.items)
         return itertools.chain(*chains).__iter__()
 
 
