@@ -188,8 +188,8 @@ void MicroBatchScheduler::setCtxRequestsChunkSize<MicroBatchScheduler::ContextCh
         SizeType32 actualChunkSize = suggestedChunkSize;
         if (ctxTokensCapacity && computeCost > ctxTokensCapacity.value())
         {
-            // Cap chunk at budget. The model forward-passes all tokens in the chunk
-            // (including reusable ones), so the chunk size cannot exceed the budget.
+            // Model processes min(chunk_size, P - reusable) tokens starting from position reusable.
+            // To keep model tokens within budget: chunk_size <= capacity (not reusable + capacity).
             actualChunkSize = ctxTokensCapacity.value();
         }
         if (maxContextLength)
@@ -208,8 +208,10 @@ void MicroBatchScheduler::setCtxRequestsChunkSize<MicroBatchScheduler::ContextCh
         llmReq->setContextChunkSize(actualChunkSize);
         if (ctxTokensCapacity)
         {
-            // Decrement by actual compute cost: tokens beyond the reusable prefix.
-            SizeType32 const modelCost = std::max<SizeType32>(0, actualChunkSize - reusable);
+            // Decrement by actual model token count: min(chunk_size, P - reusable).
+            // This equals min(actualChunkSize, computeCost) since computeCost = suggestedChunkSize - reusable.
+            SizeType32 const modelCost
+                = std::min(actualChunkSize, std::max<SizeType32>(0, suggestedChunkSize - reusable));
             ctxTokensCapacity = ctxTokensCapacity.value() - modelCost;
         }
     }
