@@ -5802,11 +5802,10 @@ TEST(KVCacheManagerReuseAccountingTest, ReuseAwareBlockEstimatesStayConsistentAf
         true,
     };
 
-    // Note: storeContextBlocks only stores (length - 1) tokens worth of blocks
-    // For 64 tokens with 16 tokens/block, only 63/16 = 3 full blocks are stored
+    // After removeSequence, blocks are free (ref=0). countReusableBlocks with the default
+    // onlyAllocated=true returns 0 — free blocks are not counted.
     auto const reusableBlocks = kvCacheManager->countReusableBlocks(req1.getUniqueTokens(0), req1);
-    auto const expectedReusableBlocks = (promptLength - 1) / tokensPerBlock; // 3 blocks
-    EXPECT_EQ(reusableBlocks, expectedReusableBlocks);
+    EXPECT_EQ(reusableBlocks, 0);
 
     // After removeSequence, reusable blocks have no active refs and are free in the eviction queue.
     // The scheduling functions must NOT subtract free reusable blocks to avoid double-counting
@@ -5823,8 +5822,10 @@ TEST(KVCacheManagerReuseAccountingTest, ReuseAwareBlockEstimatesStayConsistentAf
     auto const remainingBeforeAdd = kvCacheManager->getRemainingBlocksToCompletion(req1, onlyWindowSize);
     EXPECT_EQ(remainingBeforeAdd, numContextBlocks + numGenBlocks);
 
-    // Verify estimatedReusableTokens is still set after getRemainingBlocksToCompletion
-    EXPECT_EQ(req1.getEstimatedReusableTokens(), expectedReusableBlocks * tokensPerBlock);
+    // After removeSequence, all reusable blocks are free (no active refs).
+    // getRemainingBlocksToCompletion only counts allocated blocks (onlyAllocated=true),
+    // so estimatedReusableTokens must be 0 — free blocks can be evicted before allocation.
+    EXPECT_EQ(req1.getEstimatedReusableTokens(), 0);
 
     // After addSequence, context blocks are allocated (reuse already applied during allocation)
     // Only generation blocks remain to be allocated
@@ -5936,9 +5937,10 @@ TEST(KVCacheManagerReuseAccountingTest, CountReusableBlocksPartialMatch)
         true,
     };
 
-    // Should find 2 reusable blocks (first 32 tokens match)
+    // After removeSequence, blocks are free (ref=0). countReusableBlocks with the default
+    // onlyAllocated=true returns 0 — free blocks are not counted.
     auto const reusableBlocks = kvCacheManager->countReusableBlocks(req1.getUniqueTokens(0), req1);
-    EXPECT_EQ(reusableBlocks, 2);
+    EXPECT_EQ(reusableBlocks, 0);
 
     // After removeSequence, reusable blocks are free (no active refs).
     // getNeededBlocksOneStep must NOT subtract free reusable blocks to avoid double-counting.
@@ -6010,11 +6012,10 @@ TEST(KVCacheManagerReuseAccountingTest, GetRemainingBlocksToCompletionWithPartia
     auto const numGenBlocks = maxNewTokens / tokensPerBlock;     // 3 blocks
     EXPECT_EQ(remaining, numContextBlocks + numGenBlocks);       // 5 context + 3 generation = 8
 
-    // storeContextBlocks stores (promptLength - 1) / tokensPerBlock = 4 full blocks.
-    // getRemainingBlocksToCompletion counts ALL reusable blocks (free or allocated) for the
-    // TOKEN budget, so estimatedReusableTokens = min(4, 5) * tokensPerBlock = 64.
-    auto const numStoredBlocks = (promptLength - 1) / tokensPerBlock; // 4
-    EXPECT_EQ(req1.getEstimatedReusableTokens(), std::min(numStoredBlocks, numContextBlocks) * tokensPerBlock);
+    // After removeSequence, all reusable blocks are free (no active refs).
+    // getRemainingBlocksToCompletion only counts allocated blocks (onlyAllocated=true),
+    // so estimatedReusableTokens must be 0 — free blocks can be evicted before allocation.
+    EXPECT_EQ(req1.getEstimatedReusableTokens(), 0);
 }
 
 TEST(KVCacheManagerReuseAccountingTest, GetNeededBlocksOneStepWithFullReuse)
@@ -6203,9 +6204,10 @@ TEST(KVCacheManagerReuseAccountingTest, MultipleRequestsWithSharedPrefix)
         true,
     };
 
-    // Should reuse 2 blocks (shared prefix) — public API counts all reusable regardless of ref state
+    // After removeSequence, blocks are free (ref=0). countReusableBlocks with the default
+    // onlyAllocated=true returns 0 — free blocks are not counted.
     auto const reusableBlocks = kvCacheManager->countReusableBlocks(req1.getUniqueTokens(0), req1);
-    EXPECT_EQ(reusableBlocks, sharedPrefixLength / tokensPerBlock);
+    EXPECT_EQ(reusableBlocks, 0);
 
     // After removeSequence, reusable blocks are free (no active refs).
     // getNeededBlocksOneStep must NOT subtract free reusable blocks.
@@ -6219,6 +6221,178 @@ TEST(KVCacheManagerReuseAccountingTest, MultipleRequestsWithSharedPrefix)
     // getRemainingBlocksToCompletion: 4 context + 1 gen = 5 blocks (no subtraction; blocks are free)
     auto const remaining = kvCacheManager->getRemainingBlocksToCompletion(req1, onlyWindowSize);
     EXPECT_EQ(remaining, (promptLength / tokensPerBlock) + (maxNewTokens / tokensPerBlock));
+
+    // Free blocks must not be counted for the token budget either — estimatedReusableTokens = 0.
+    EXPECT_EQ(req1.getEstimatedReusableTokens(), 0);
+}
+
+// Allocated (ref-counted) blocks from a concurrently-active request ARE safe to count for
+// estimatedReusableTokens because they cannot be evicted while their ref count is non-zero.
+TEST(KVCacheManagerReuseAccountingTest, AllocatedPrefixCountedForEstimatedReuse)
+{
+    auto const stream = std::make_shared<tr::CudaStream>();
+    auto constexpr tokensPerBlock = 16;
+    auto constexpr prefixLength = 48;                                // 3 blocks; storeContextBlocks stores 2
+    auto constexpr uniqueSuffixLength = 16;                          // 1 block
+    auto constexpr promptLength = prefixLength + uniqueSuffixLength; // 4 blocks total
+    auto constexpr maxNewTokens = 16;                                // 1 gen block
+    auto constexpr maxBeamWidth = 1;
+    auto constexpr maxAttentionWindow = 512;
+    auto constexpr maxNumTokens = 1024;
+
+    auto kvCacheManager = createKvCacheManager(
+        KvCacheManagerInstantiationParameters{
+            /* numLayers */ 1,
+            /* numHeads */ 1,
+            /* sizePerHead */ 1,
+            /* tokensPerBlock */ tokensPerBlock,
+            /* blocksPerWindow */ blocksAndWindow(/* numPrimaryBlocks */ 256, /* windowSize */ maxAttentionWindow),
+            /* sinkTokenLength */ 0,
+            /* maxAttentionWindow */ maxAttentionWindow,
+            /* maxBeamWidth */ maxBeamWidth,
+            /* maxNumTokens */ maxNumTokens,
+            /* kvCacheBlockReuse */ true,
+        },
+        stream);
+    kvCacheManager->allocatePools(/*useUvm=*/false);
+    auto const onlyWindowSize = theOnlyWindowSize(*kvCacheManager);
+
+    // Shared prefix tokens
+    std::vector<TokenIdType> prefixTokens(prefixLength);
+    std::iota(prefixTokens.begin(), prefixTokens.end(), 0);
+
+    // req0: cache the prefix and keep the sequence active (blocks stay allocated / ref > 0)
+    auto tokens0 = std::make_shared<std::vector<TokenIdType>>(prefixTokens);
+    for (int i = 0; i < uniqueSuffixLength; ++i)
+    {
+        tokens0->push_back(1000 + i);
+    }
+    auto req0 = LlmRequest{0, maxNewTokens, tokens0, tensorrt_llm::runtime::SamplingConfig{maxBeamWidth}, true};
+    kvCacheManager->addSequence(req0.mRequestId, req0.getPromptLen(), maxBeamWidth, req0);
+    kvCacheManager->storeContextBlocks(req0);
+    // Do NOT remove req0 — its blocks remain allocated with active refs.
+
+    // req1 shares the same prefix; req0's blocks are still alive in the tree.
+    auto tokens1 = std::make_shared<std::vector<TokenIdType>>(prefixTokens);
+    for (int i = 0; i < uniqueSuffixLength; ++i)
+    {
+        tokens1->push_back(2000 + i);
+    }
+    auto req1 = LlmRequest{1, maxNewTokens, tokens1, tensorrt_llm::runtime::SamplingConfig{maxBeamWidth}, true};
+
+    // req0 (promptLength=64) calls storeContextBlocks which stores (64-1)/16 = 3 full
+    // blocks, covering tokens 0..47 — exactly the entire prefix. All 3 are in the radix
+    // tree with active refs (req0 still alive), so countReusableBlocks(onlyAllocated=true) = 3.
+    auto const numAllocatedPrefixBlocks = prefixLength / tokensPerBlock; // 3
+    auto const numContextBlocks = promptLength / tokensPerBlock;         // 4
+
+    // getRemainingBlocksToCompletion should count the 3 allocated prefix blocks for the
+    // token budget since they are protected by req0's active refs and cannot be evicted.
+    auto const remaining = kvCacheManager->getRemainingBlocksToCompletion(req1, onlyWindowSize);
+    // Block budget: 4 context - 3 reusable allocated + 1 gen = 2
+    EXPECT_EQ(remaining, (numContextBlocks - numAllocatedPrefixBlocks) + (maxNewTokens / tokensPerBlock));
+    // Token budget: 3 allocated prefix blocks are safe to subtract.
+    EXPECT_EQ(req1.getEstimatedReusableTokens(), numAllocatedPrefixBlocks * tokensPerBlock);
+
+    // Cleanup
+    kvCacheManager->removeSequence(req0.mRequestId, req0);
+}
+
+// Regression test for the over-admission bug described in the concern document:
+// requests with *different* prefixes each see free-pool blocks as "reusable", but those
+// blocks can be evicted by earlier addSequence() calls before allocation time.
+// With the fix, estimatedReusableTokens is 0 for all free-pool blocks, so the scheduler
+// cannot over-admit regardless of eviction order.
+TEST(KVCacheManagerReuseAccountingTest, DifferentPrefixFreeBlocksGiveZeroEstimatedReuse)
+{
+    auto const stream = std::make_shared<tr::CudaStream>();
+    auto constexpr tokensPerBlock = 16;
+    // Each prefix fills exactly 2 storable blocks: (prefixLength - 1) / tokensPerBlock = 2
+    // → prefixLength = 33..48 works; use 48 for clarity.
+    auto constexpr prefixLength = 48; // storeContextBlocks stores 2 full blocks
+    auto constexpr uniqueLength = 16; // 1 unique block per request
+    auto constexpr promptLength = prefixLength + uniqueLength;
+    auto constexpr maxNewTokens = 16;
+    auto constexpr maxBeamWidth = 1;
+    auto constexpr maxAttentionWindow = 512;
+    auto constexpr maxNumTokens = 1024;
+
+    auto kvCacheManager = createKvCacheManager(
+        KvCacheManagerInstantiationParameters{
+            /* numLayers */ 1,
+            /* numHeads */ 1,
+            /* sizePerHead */ 1,
+            /* tokensPerBlock */ tokensPerBlock,
+            /* blocksPerWindow */ blocksAndWindow(/* numPrimaryBlocks */ 256, /* windowSize */ maxAttentionWindow),
+            /* sinkTokenLength */ 0,
+            /* maxAttentionWindow */ maxAttentionWindow,
+            /* maxBeamWidth */ maxBeamWidth,
+            /* maxNumTokens */ maxNumTokens,
+            /* kvCacheBlockReuse */ true,
+        },
+        stream);
+    kvCacheManager->allocatePools(/*useUvm=*/false);
+    auto const onlyWindowSize = theOnlyWindowSize(*kvCacheManager);
+
+    // Helper to build tokens for a given prefix base and unique suffix offset.
+    auto makeTokens = [&](int prefixBase, int suffixBase)
+    {
+        auto tokens = std::make_shared<std::vector<TokenIdType>>(promptLength);
+        std::iota(tokens->begin(), tokens->begin() + prefixLength, prefixBase);
+        std::iota(tokens->begin() + prefixLength, tokens->end(), suffixBase);
+        return tokens;
+    };
+
+    // Cache three distinct prefixes P_A, P_B, P_C then release all sequences.
+    // Afterwards, each prefix's blocks are in the free/eviction pool (ref count = 0).
+    for (int i = 0; i < 3; ++i)
+    {
+        auto tokens = makeTokens(i * 100, 9000 + i * 100);
+        auto req = LlmRequest{
+            static_cast<uint64_t>(i), maxNewTokens, tokens, tensorrt_llm::runtime::SamplingConfig{maxBeamWidth}, true};
+        kvCacheManager->addSequence(req.mRequestId, req.getPromptLen(), maxBeamWidth, req);
+        kvCacheManager->storeContextBlocks(req);
+        kvCacheManager->removeSequence(req.mRequestId, req);
+    }
+
+    // Now create three new requests, each matching a different cached prefix.
+    auto reqA
+        = LlmRequest{10, maxNewTokens, makeTokens(0, 5000), tensorrt_llm::runtime::SamplingConfig{maxBeamWidth}, true};
+    auto reqB = LlmRequest{
+        11, maxNewTokens, makeTokens(100, 5100), tensorrt_llm::runtime::SamplingConfig{maxBeamWidth}, true};
+    auto reqC = LlmRequest{
+        12, maxNewTokens, makeTokens(200, 5200), tensorrt_llm::runtime::SamplingConfig{maxBeamWidth}, true};
+
+    // --- Scheduling phase ---
+    // All three requests see their matching prefix in the free pool, but since those
+    // blocks are not allocated (ref count = 0), estimatedReusableTokens must be 0.
+    // This prevents the scheduler from crediting reuse that could be invalidated later.
+    kvCacheManager->getRemainingBlocksToCompletion(reqA, onlyWindowSize);
+    EXPECT_EQ(reqA.getEstimatedReusableTokens(), 0) << "reqA: free prefix blocks must not be counted";
+
+    kvCacheManager->getRemainingBlocksToCompletion(reqB, onlyWindowSize);
+    EXPECT_EQ(reqB.getEstimatedReusableTokens(), 0) << "reqB: free prefix blocks must not be counted";
+
+    kvCacheManager->getRemainingBlocksToCompletion(reqC, onlyWindowSize);
+    EXPECT_EQ(reqC.getEstimatedReusableTokens(), 0) << "reqC: free prefix blocks must not be counted";
+
+    // --- Allocation phase for reqA ---
+    // addSequence(reqA) claims P_A blocks and allocates new blocks for the unique suffix.
+    // getFreeBlock() may evict P_B or P_C blocks from the radix tree in this process.
+    kvCacheManager->addSequence(reqA.mRequestId, reqA.getPromptLen(), maxBeamWidth, reqA);
+
+    // After reqA allocation, re-run scheduling estimates for reqB and reqC.
+    // Their prefixes may now be partially or fully evicted, but since we never credited
+    // them in the first place (estimatedReusableTokens was already 0), the budget remains
+    // consistent — no over-admission can have occurred.
+    kvCacheManager->getRemainingBlocksToCompletion(reqB, onlyWindowSize);
+    EXPECT_EQ(reqB.getEstimatedReusableTokens(), 0) << "reqB: estimate unchanged after reqA eviction";
+
+    kvCacheManager->getRemainingBlocksToCompletion(reqC, onlyWindowSize);
+    EXPECT_EQ(reqC.getEstimatedReusableTokens(), 0) << "reqC: estimate unchanged after reqA eviction";
+
+    // Cleanup
+    kvCacheManager->removeSequence(reqA.mRequestId, reqA);
 }
 
 // All remove events for the same window size during a single iteration must be consolidated
