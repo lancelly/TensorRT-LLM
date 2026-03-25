@@ -345,10 +345,8 @@ std::tuple<RequestVector, RequestVector> MicroBatchScheduler::operator()(Request
                 }
                 contextsToBeChunked.emplace_back(llmReq);
                 numChunkedComputeTokens += computeTokens;
-                TLLM_LOG_INFO(
-                    "contexts-to-be-chunked request: ID %lu, contextRemaining %d, reusable %d, computeTokens %d, isFirstChunk %d",
-                    llmReq->mRequestId, llmReq->getContextRemainingLength(), reusable, computeTokens,
-                    llmReq->isFirstContextChunk() ? 1 : 0);
+                TLLM_LOG_DEBUG(
+                    "contexts-to-be-chunked request scheduled: ID %u (reusable %d)", llmReq->mRequestId, reusable);
             }
         }
         else // (llmReq->isGenerationInProgressState())
@@ -381,8 +379,6 @@ std::tuple<RequestVector, RequestVector> MicroBatchScheduler::operator()(Request
         }
     }
 
-    SizeType32 const genTokensBudgetUsed = batchNumTokens;
-
     if (maxNumTokensRuntime && numChunkedComputeTokens > maxNumTokensRuntime.value() - batchNumTokens)
     {
         allContextRequestsFit = false;
@@ -407,22 +403,21 @@ std::tuple<RequestVector, RequestVector> MicroBatchScheduler::operator()(Request
             SizeType32 const reusable = llmReq->isFirstContextChunk() ? llmReq->getEstimatedReusableTokens() : 0;
             SizeType32 const computeTokens = std::max(0, llmReq->getContextChunkSize() - reusable);
             batchNumTokens += computeTokens;
-            TLLM_LOG_INFO("context request scheduled: ID %lu, chunk size %d%s", llmReq->mRequestId,
+            TLLM_LOG_DEBUG("context request scheduled: ID %lu, chunk size %d%s", llmReq->mRequestId,
                 llmReq->getContextChunkSize(), reusable > 0 ? (", reusable " + std::to_string(reusable)).c_str() : "");
         }
     }
 
     utils::sortRequests(contextRequests, generationRequests, !allContextRequestsFit);
 
-    TLLM_LOG_INFO(
-        "[MicroBatchScheduler] batch: %zu ctx + %zu gen reqs, "
-        "genTokens=%d, ctxTokens(compute)=%d, totalTokens(compute)=%d / maxNumTokens=%d, "
-        "budgetRemaining=%d, allContextFit=%d, chunkedCtxReqs=%zu",
-        contextRequests.size(), generationRequests.size(),
-        genTokensBudgetUsed, batchNumTokens - genTokensBudgetUsed, batchNumTokens,
-        maxNumTokensRuntime.value_or(0),
-        maxNumTokensRuntime.value_or(0) - batchNumTokens,
-        allContextRequestsFit ? 1 : 0, contextsToBeChunked.size());
+    TLLM_LOG_DEBUG(
+        "batchSize (num ctx/enc requests + num gen requests): %u", contextRequests.size() + generationRequests.size());
+    TLLM_LOG_DEBUG("batchNumTokens (num ctx/enc input tokens + num gen input tokens) / maxNumTokens: %d / %d",
+        batchNumTokens, maxNumTokensRuntime.value_or(0));
+    TLLM_LOG_DEBUG(
+        "[Summary] Micro Batch scheduler schedules %d context/encoder requests, %d generation requests. "
+        "%d requests inflight with the model already",
+        contextRequests.size(), generationRequests.size(), inflightReqIds.size());
 
     TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
     return {std::move(contextRequests), std::move(generationRequests)};
