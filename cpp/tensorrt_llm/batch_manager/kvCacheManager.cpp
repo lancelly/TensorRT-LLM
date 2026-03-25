@@ -2339,15 +2339,21 @@ SizeType32 KVCacheManager::getRemainingBlocksToCompletion(LlmRequest const& req,
         && numAllocBlocksPerBeam == 0)
     {
         auto const uniqueTokens = req.getUniqueTokens(0);
-        // Both block and token budgets use only allocated blocks (have active refs).
+        // Block budget: only subtract blocks that are already allocated (have active refs).
+        // Free cached blocks are already counted in the eviction policy's free pool and
+        // must not be double-counted against the capacity estimate.
         auto const numReusableBlocksAllocated = countReusableBlocks(uniqueTokens, req, /*onlyAllocated=*/true);
         numReusableContextBlocks = std::min(numReusableBlocksAllocated, numContextBlocks);
-        req.setEstimatedReusableTokens(numReusableContextBlocks * getTokensPerBlock());
+        // Token budget: count all reusable blocks (free or allocated). Cached tokens need
+        // not be recomputed regardless of whether their blocks currently have active refs.
+        auto const numReusableBlocksAll = countReusableBlocks(uniqueTokens, req, /*onlyAllocated=*/false);
+        req.setEstimatedReusableTokens(std::min(numReusableBlocksAll, numContextBlocks) * getTokensPerBlock());
         TLLM_LOG_DEBUG(
             "getRemainingBlocksToCompletion: request ID %lu, numContextBlocks=%d, "
-            "numReusableBlocksAllocated=%d, numReusableContextBlocks=%d, numGenBlocksPerBeam=%d",
-            req.mRequestId, numContextBlocks, numReusableBlocksAllocated, numReusableContextBlocks,
-            numGenBlocksPerBeam);
+            "numReusableBlocksAllocated=%d, numReusableBlocksAll=%d, "
+            "numReusableContextBlocks=%d, numGenBlocksPerBeam=%d",
+            req.mRequestId, numContextBlocks, numReusableBlocksAllocated, numReusableBlocksAll,
+            numReusableContextBlocks, numGenBlocksPerBeam);
     }
 
     // In case of sliding window attention, a new block is allocated when the
