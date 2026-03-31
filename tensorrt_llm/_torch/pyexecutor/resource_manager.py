@@ -585,6 +585,23 @@ class KVCacheManager(BaseResourceManager):
             # wait for all pending work to finish before launching offload/onboarding/partial copy
             self.impl.sync_transfer_manager_with_buffer_manager()
 
+            # Track actual compute tokens to enforce max_num_tokens budget.
+            # The scheduler estimates reusable tokens from the radix tree, but
+            # earlier addSequence calls can evict cached blocks, reducing reuse
+            # for later requests.  Before each addSequence we re-probe the
+            # radix tree (read-only) to get the true reuse count and skip
+            # the request if it would exceed the budget.
+            actual_compute_budget = None
+            if self.enable_block_reuse and not self.is_draft:
+                gen_tokens = sum(
+                    req.get_beam_width_by_iter(for_next_iteration=False)
+                    + get_draft_token_length(req)
+                    for req in scheduled_batch.generation_requests)
+                actual_compute_budget = self.max_num_tokens - gen_tokens
+
+            accepted_ctx_requests = []
+            actual_ctx_compute = 0
+
             # allocate KV Cache
             for req in scheduled_batch.context_requests:
                 req_beam_width = req.sampling_config.beam_width
@@ -601,6 +618,27 @@ class KVCacheManager(BaseResourceManager):
                 else:
                     if req.is_first_context_chunk and self._kv_connector_should_add_sequence(
                             req):
+                        # Probe the radix tree BEFORE allocating to get the
+                        # true reusable token count (reflects earlier
+                        # addSequence side-effects on the tree).
+                        if actual_compute_budget is not None:
+                            unique_tokens = req.get_unique_tokens(0)
+                            reusable_blocks = self.impl.count_reusable_blocks(
+                                unique_tokens, req, False)
+                            actual_reuse = reusable_blocks * self.tokens_per_block
+                            chunk_size = req.context_chunk_size
+                            req_compute = max(1, chunk_size - actual_reuse)
+                            if actual_ctx_compute + req_compute > actual_compute_budget:
+                                logger.warning(
+                                    "Reuse budget check: req %s needs %d "
+                                    "compute tokens (chunk=%d, reuse=%d), "
+                                    "budget remaining=%d. Skipping request.",
+                                    req.py_request_id, req_compute,
+                                    chunk_size, actual_reuse,
+                                    actual_compute_budget - actual_ctx_compute)
+                                break
+                            actual_ctx_compute += req_compute
+
                         self.impl.add_sequence(req.py_request_id,
                                                req.prompt_len, req_beam_width,
                                                req)
@@ -614,8 +652,10 @@ class KVCacheManager(BaseResourceManager):
                             self.kv_connector_manager.update_state_after_alloc(
                                 req, block_ids)
 
+                accepted_ctx_requests.append(req)
+
             # A request may change from `context_requests_chunking` to `context_requests_last_chunk` in `add_sequence` due to KV cache reuse, so we rebuild the context request lists here.
-            scheduled_batch.reset_context_requests()
+            scheduled_batch.reset_context_requests(accepted_ctx_requests)
 
             for req in scheduled_batch.generation_requests:
                 if self.mapping.has_cp_helix():
