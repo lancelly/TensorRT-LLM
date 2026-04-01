@@ -585,24 +585,6 @@ class KVCacheManager(BaseResourceManager):
             # wait for all pending work to finish before launching offload/onboarding/partial copy
             self.impl.sync_transfer_manager_with_buffer_manager()
 
-            # The scheduler estimates reusable tokens from the radix tree to
-            # compute the token budget, but addSequence calls within this loop
-            # can evict cached blocks (via getFreeBlock), reducing actual reuse
-            # for later requests.  We re-probe the radix tree before each
-            # addSequence to get the true reuse count and skip first-context-
-            # chunk requests that would exceed the compute budget.
-            # Chunking continuations are never skipped because their sequences
-            # already exist in the C++ KV cache manager.
-            remaining_budget = None
-            if self.enable_block_reuse and not self.is_draft:
-                gen_tokens = sum(
-                    req.get_beam_width_by_iter(for_next_iteration=False)
-                    + get_draft_token_length(req)
-                    for req in scheduled_batch.generation_requests)
-                remaining_budget = self.max_num_tokens - gen_tokens
-
-            accepted_ctx_requests = []
-
             # allocate KV Cache
             for req in scheduled_batch.context_requests:
                 req_beam_width = req.sampling_config.beam_width
@@ -619,25 +601,6 @@ class KVCacheManager(BaseResourceManager):
                 else:
                     if req.is_first_context_chunk and self._kv_connector_should_add_sequence(
                             req):
-                        if remaining_budget is not None:
-                            unique_tokens = req.get_unique_tokens(0)
-                            reusable_blocks = self.impl.count_reusable_blocks(
-                                unique_tokens, req, False)
-                            actual_reuse = (reusable_blocks
-                                            * self.tokens_per_block)
-                            chunk_size = req.context_chunk_size
-                            req_compute = max(1, chunk_size - actual_reuse)
-                            if req_compute > remaining_budget:
-                                logger.warning(
-                                    "Reuse budget: skip req %d "
-                                    "(compute=%d, chunk=%d, reuse=%d, "
-                                    "remaining=%d)",
-                                    req.py_request_id, req_compute,
-                                    chunk_size, actual_reuse,
-                                    remaining_budget)
-                                continue
-                            remaining_budget -= req_compute
-
                         pre_pos = req.context_current_position
                         pre_chunk = req.context_chunk_size
                         self.impl.add_sequence(req.py_request_id,
@@ -650,42 +613,34 @@ class KVCacheManager(BaseResourceManager):
 
                         post_pos = req.context_current_position
                         post_chunk = req.context_chunk_size
-                        actual_compute = max(
-                            1,
-                            min(post_chunk,
-                                req.prompt_len - post_pos))
-                        counted_reuse = (
-                            reusable_blocks * self.tokens_per_block
-                            if remaining_budget is not None else -1)
-                        if (remaining_budget is not None
-                                and actual_compute > req_compute + 32):
+                        actual_compute = min(
+                            post_chunk,
+                            max(0, req.prompt_len - post_pos))
+                        sched_reuse = req.estimated_reusable_tokens
+                        sched_compute = max(
+                            1, pre_chunk - sched_reuse
+                        ) if req.is_first_context_chunk else pre_chunk
+                        if actual_compute > sched_compute + 32:
                             logger.warning(
-                                "Reuse mismatch: req %d "
-                                "prompt=%d pre_pos=%d pre_chunk=%d "
-                                "counted_reuse=%d budget_compute=%d | "
-                                "post_pos=%d post_chunk=%d "
-                                "actual_compute=%d delta=%d",
-                                req.py_request_id,
-                                req.prompt_len, pre_pos, pre_chunk,
-                                counted_reuse, req_compute,
-                                post_pos, post_chunk,
-                                actual_compute,
-                                actual_compute - req_compute)
+                                f"Reuse mismatch: req "
+                                f"{req.py_request_id} "
+                                f"prompt={req.prompt_len} "
+                                f"pre_pos={pre_pos} "
+                                f"pre_chunk={pre_chunk} "
+                                f"sched_reuse={sched_reuse} "
+                                f"sched_compute={sched_compute} | "
+                                f"post_pos={post_pos} "
+                                f"post_chunk={post_chunk} "
+                                f"actual_compute={actual_compute} "
+                                f"delta={actual_compute - sched_compute}")
 
                         if self.kv_connector_manager is not None:
                             block_ids = self.get_cache_indices(req)
                             self.kv_connector_manager.update_state_after_alloc(
                                 req, block_ids)
-                    elif remaining_budget is not None:
-                        reusable = (req.estimated_reusable_tokens
-                                    if req.is_first_context_chunk else 0)
-                        remaining_budget -= max(
-                            0, req.context_chunk_size - reusable)
-
-                accepted_ctx_requests.append(req)
 
             # A request may change from `context_requests_chunking` to `context_requests_last_chunk` in `add_sequence` due to KV cache reuse, so we rebuild the context request lists here.
-            scheduled_batch.reset_context_requests(accepted_ctx_requests)
+            scheduled_batch.reset_context_requests()
 
             for req in scheduled_batch.generation_requests:
                 if self.mapping.has_cp_helix():

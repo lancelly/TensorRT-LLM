@@ -2649,11 +2649,11 @@ class PyTorchModelEngine(ModelEngine):
             gen_count = len(scheduled_requests.generation_requests)
             from tensorrt_llm.logger import logger as _mnt_logger
             _mnt_logger.error(
-                "MNT overflow: total=%d max=%d ctx_reqs=%d gen_reqs=%d "
-                "ctx_breakdown=[%s]",
-                total_num_tokens, self.max_num_tokens,
-                len(scheduled_requests.context_requests), gen_count,
-                "; ".join(ctx_details))
+                f"MNT overflow: total={total_num_tokens} "
+                f"max={self.max_num_tokens} "
+                f"ctx_reqs={len(scheduled_requests.context_requests)} "
+                f"gen_reqs={gen_count} "
+                f"ctx_breakdown=[{'; '.join(ctx_details)}]")
         assert total_num_tokens <= self.max_num_tokens, (
             f"total_num_tokens ({total_num_tokens}) should be less than or equal to max_num_tokens ({self.max_num_tokens})"
         )
