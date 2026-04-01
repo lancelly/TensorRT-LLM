@@ -636,6 +636,13 @@ class KVCacheManager(BaseResourceManager):
                                     f"remaining={remaining_budget})")
                                 continue
                             remaining_budget -= req_compute
+                            logger.info(
+                                f"Reuse budget: accept req "
+                                f"{req.py_request_id} "
+                                f"(compute={req_compute}, "
+                                f"chunk={req.context_chunk_size}, "
+                                f"reuse={actual_reuse}, "
+                                f"remaining={remaining_budget})")
 
                         try:
                             self.impl.add_sequence(

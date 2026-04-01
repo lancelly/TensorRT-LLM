@@ -1181,9 +1181,11 @@ std::optional<BlockKey> WindowBlockManager::findNewContextBlock(
 SizeType32 WindowBlockManager::countReusableBlocks(
     VecUniqueTokens const& uniqueTokens, LlmRequest const& llmRequest, bool onlyAllocated) const
 {
-    // Chop tokens into full blocks only (allowPartial=false)
+    // Match loadOrAllocateBlocks which uses inputLength - 1 (the last token's
+    // KV state is not yet recorded, so it cannot be reused).
+    auto const usableSize = std::max<SizeType32>(0, static_cast<SizeType32>(uniqueTokens.size()) - 1);
     auto blockedUniqueTokens
-        = chopVectorIntoBlocks<UniqueToken>(uniqueTokens, uniqueTokens.size(), mTokensPerBlock, false);
+        = chopVectorIntoBlocks<UniqueToken>(uniqueTokens, usableSize, mTokensPerBlock, false);
     auto blockKeys = buildBlockKeys(blockedUniqueTokens, llmRequest);
 
     SizeType32 reusableBlocks = 0;
@@ -1192,23 +1194,30 @@ SizeType32 WindowBlockManager::countReusableBlocks(
 
     for (auto const& blockKey : blockKeys)
     {
+        // Use the same partial-reuse settings as loadOrAllocateBlocks so that
+        // a not-full block triggers a partial match here too.  Without this,
+        // countReusableBlocks would count blocks past a partial-match point
+        // that loadOrAllocateBlocks will never reach (it sets searchRoot=nullptr
+        // on partial match), causing the budget estimate to exceed actual reuse.
         auto [partialMatch, numMatched, matchingBlock] = searchRoot != nullptr
-            ? searchRoot->findMatchingBlock(blockKey, false, false)
+            ? searchRoot->findMatchingBlock(blockKey, mEnablePartialReuse, mCopyOnPartialReuse)
             : std::make_tuple(false, 0, nullptr);
 
         if (matchingBlock == nullptr)
         {
-            // No more matching blocks found
             break;
         }
 
-        // When onlyAllocated is true, only count blocks that are already allocated
-        // to an active sequence (have refs). Sharing these blocks doesn't consume
-        // from the free pool. Free cached blocks (no refs) are already counted in
-        // the eviction policy's free count and must not be double-counted.
+        // A partial match means loadOrAllocateBlocks will stop matching here
+        // (searchRoot = nullptr).  Count this block but stop afterwards.
         if (!onlyAllocated || matchingBlock->hasRefs())
         {
             ++reusableBlocks;
+        }
+
+        if (partialMatch)
+        {
+            break;
         }
         searchRoot = std::move(matchingBlock);
     }
