@@ -2746,7 +2746,14 @@ class PyExecutor:
             # reusable count is subtracted.
             reusable_in_chunk = max(0,
                                     reusable - ctx_req.context_current_position)
-            compute = max(1, ctx_req.context_chunk_size - reusable_in_chunk)
+            remaining = ctx_req.context_remaining_length
+            if (reusable_in_chunk > 0
+                    and reusable_in_chunk + ctx_req.context_chunk_size
+                    < remaining):
+                compute = ctx_req.context_chunk_size
+            else:
+                compute = max(1,
+                              ctx_req.context_chunk_size - reusable_in_chunk)
             num_scheduled_ctx_tokens += compute
         num_scheduled_gen_tokens = sum(1 + gen_req.num_draft_tokens
                                        for gen_req in generation_requests)
@@ -2780,7 +2787,12 @@ class PyExecutor:
             reusable = (ctx_req.estimated_reusable_tokens
                         if ctx_req.is_first_context_chunk else 0)
             reusable_in_chunk = max(0, reusable - begin)
-            formula_contrib = max(1, chunk_sz - reusable_in_chunk)
+            remaining = ctx_req.context_remaining_length
+            if (reusable_in_chunk > 0
+                    and reusable_in_chunk + chunk_sz < remaining):
+                formula_contrib = chunk_sz
+            else:
+                formula_contrib = max(1, chunk_sz - reusable_in_chunk)
             if i < max_detail:
                 ctx_summaries.append(
                     f"rid={ctx_req.py_request_id} full={full_len} pos={begin} "
