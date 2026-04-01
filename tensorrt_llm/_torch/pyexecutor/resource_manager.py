@@ -638,6 +638,8 @@ class KVCacheManager(BaseResourceManager):
                                 continue
                             remaining_budget -= req_compute
 
+                        pre_pos = req.context_current_position
+                        pre_chunk = req.context_chunk_size
                         self.impl.add_sequence(req.py_request_id,
                                                req.prompt_len, req_beam_width,
                                                req)
@@ -645,6 +647,30 @@ class KVCacheManager(BaseResourceManager):
                             self.impl.add_token(req.py_request_id)
                         for _ in range(get_draft_token_length(req)):
                             self.impl.add_token(req.py_request_id)
+
+                        post_pos = req.context_current_position
+                        post_chunk = req.context_chunk_size
+                        actual_compute = max(
+                            1,
+                            min(post_chunk,
+                                req.prompt_len - post_pos))
+                        counted_reuse = (
+                            reusable_blocks * self.tokens_per_block
+                            if remaining_budget is not None else -1)
+                        if (remaining_budget is not None
+                                and actual_compute > req_compute + 32):
+                            logger.warning(
+                                "Reuse mismatch: req %d "
+                                "prompt=%d pre_pos=%d pre_chunk=%d "
+                                "counted_reuse=%d budget_compute=%d | "
+                                "post_pos=%d post_chunk=%d "
+                                "actual_compute=%d delta=%d",
+                                req.py_request_id,
+                                req.prompt_len, pre_pos, pre_chunk,
+                                counted_reuse, req_compute,
+                                post_pos, post_chunk,
+                                actual_compute,
+                                actual_compute - req_compute)
 
                         if self.kv_connector_manager is not None:
                             block_ids = self.get_cache_indices(req)
