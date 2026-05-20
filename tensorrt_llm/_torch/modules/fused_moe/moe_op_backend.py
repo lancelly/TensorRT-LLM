@@ -236,8 +236,17 @@ class TRTLLMOpBackend(MoEOpBackend):
         tune_max_num_tokens=8192,
         use_dp=False,
     ):
-        from tensorrt_llm._torch.pyexecutor.trace_log_utils import \
-            moe_activation_probe
+        from tensorrt_llm._torch.pyexecutor.trace_log_utils import (
+            moe_activation_probe, moe_intermediate_size_probe)
+        moe_intermediate_size_probe(
+            "fp8_block_scale",
+            num_tokens=hidden_states.shape[0],
+            top_k=top_k,
+            num_experts=num_experts,
+            intermediate_size=intermediate_size,
+            hidden_size=hidden_states.shape[1],
+            local_num_experts=local_num_experts,
+        )
         with moe_activation_probe("fp8_block_scale",
                                   hidden_states.shape[0], top_k):
             return torch.ops.trtllm.fp8_block_scale_moe_runner(
@@ -312,8 +321,17 @@ class TRTLLMOpBackend(MoEOpBackend):
                 and gemm1_weights_scale.shape[-1] == hidden_size // 16
             ):
                 # nvfp4
-                from tensorrt_llm._torch.pyexecutor.trace_log_utils import \
-                    moe_activation_probe
+                from tensorrt_llm._torch.pyexecutor.trace_log_utils import (
+                    moe_activation_probe, moe_intermediate_size_probe)
+                moe_intermediate_size_probe(
+                    "nvfp4_block_scale",
+                    num_tokens=hidden_states.shape[0],
+                    top_k=top_k,
+                    num_experts=num_experts,
+                    intermediate_size=intermediate_size,
+                    hidden_size=hidden_size,
+                    local_num_experts=local_num_experts,
+                )
                 with moe_activation_probe("nvfp4_block_scale",
                                           hidden_states.shape[0], top_k):
                     outputs = torch.ops.trtllm.fp4_block_scale_moe_runner(
@@ -362,8 +380,17 @@ class TRTLLMOpBackend(MoEOpBackend):
                 and gemm1_weights_scale.shape[-1] == hidden_size // 32
             ):
                 # mxfp4
-                from tensorrt_llm._torch.pyexecutor.trace_log_utils import \
-                    moe_activation_probe
+                from tensorrt_llm._torch.pyexecutor.trace_log_utils import (
+                    moe_activation_probe, moe_intermediate_size_probe)
+                moe_intermediate_size_probe(
+                    "mxfp4_block_scale",
+                    num_tokens=hidden_states.shape[0],
+                    top_k=top_k,
+                    num_experts=num_experts,
+                    intermediate_size=intermediate_size,
+                    hidden_size=hidden_size,
+                    local_num_experts=local_num_experts,
+                )
                 with moe_activation_probe("mxfp4_block_scale",
                                           hidden_states.shape[0], top_k):
                     return torch.ops.trtllm.mxe4m3_mxe2m1_block_scale_moe_runner(

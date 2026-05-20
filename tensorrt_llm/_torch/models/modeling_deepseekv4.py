@@ -44,6 +44,7 @@ import tensorrt_llm.quantization.utils.fp4_utils as fp4_utils
 from tensorrt_llm._ipc_utils import can_access_peer
 from tensorrt_llm._utils import get_sm_version
 from tensorrt_llm.functional import PositionEmbeddingType, RotaryScalingType
+from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.models.modeling_utils import QuantConfig
 from tensorrt_llm.quantization.mode import QuantAlgo
@@ -81,6 +82,7 @@ from ..modules.mhc.hyper_connection import HCHead, HCState, mHC
 from ..modules.multi_stream_utils import maybe_execute_in_parallel
 from ..modules.rms_norm import RMSNorm
 from ..peft.lora.layer import LoraLayer
+from ..pyexecutor.trace_log_utils import log_tensor_size_once
 from ..speculative import SpecMetadata
 from ..utils import (
     AuxStreamType,
@@ -1937,6 +1939,16 @@ class DeepseekV4DecoderLayer(DecoderLayer):
             all_reduce_params=AllReduceParams(enable_allreduce=not (self.disable_attn_allreduce)),
             **kwargs,
         )
+        # mem-profile: log the per-layer attention output footprint once per
+        # unique (layer_idx, shape) pair. Uses self.layer_idx (decoder layer's
+        # own, set at __init__) NOT self.self_attn.layer_idx — the latter is
+        # remapped for MTP layers and would collide with target's layer 0.
+        log_tensor_size_once(
+            "dsv4/attn_output",
+            x_attn,
+            layer_idx=self.layer_idx,
+            dedup_key=("dsv4_attn", self.layer_idx, tuple(x_attn.shape)),
+        )
 
         # -------------------------------------------------------------------
         # Mid-layer boundary: fuse hc_attn.post_mapping + hc_ffn.pre_mapping.
@@ -2335,6 +2347,13 @@ class DeepseekV4Model(DecoderModel):
         self.norm = RMSNorm(
             hidden_size=config.hidden_size, eps=config.rms_norm_eps, dtype=config.torch_dtype
         )
+        # One-shot gate for [mem-profile/dsv4/layer_peak] probe (env-gated by
+        # TLLM_LOG_MEM_PROFILE=1). Safe under cuda-graph: warmup runs
+        # no_cuda_graph() (model_engine.py:861), so first forward is eager
+        # Python; after first forward this bool flips True and subsequent
+        # forwards (including any later cuda-graph capture / replay) short-
+        # circuit at the env+bool check below.
+        self._mem_profile_first_forward_done = False
 
     def __pp_init__(self):
         self.epilogue.append(self.hc_head)
@@ -2410,6 +2429,19 @@ class DeepseekV4Model(DecoderModel):
         # a standalone hc_post; a resolved state feeds hc_head directly.
         hc_state = hidden_states
 
+        # mem-profile probe 3: per-layer peak memory, fires only on first
+        # forward iteration. Gated by TLLM_LOG_MEM_PROFILE=1 + one-shot bool.
+        # See __init__ for cuda-graph safety reasoning.
+        do_per_layer_probe = (
+            os.environ.get("TLLM_LOG_MEM_PROFILE", "") == "1"
+            and not self._mem_profile_first_forward_done
+        )
+        if do_per_layer_probe:
+            _probe_rank = (torch.distributed.get_rank()
+                           if torch.distributed.is_initialized() else 0)
+            torch.cuda.synchronize()
+            torch.cuda.reset_peak_memory_stats()
+
         for idx, decoder_layer in enumerate(self.layers[: self.num_hidden_layers]):
             engram_embeddings = None
             if engram_embeddings_cache is not None and idx in engram_embeddings_cache:
@@ -2426,6 +2458,21 @@ class DeepseekV4Model(DecoderModel):
                 input_ids=input_ids,
                 engram_embeddings=engram_embeddings,
             )
+
+            if do_per_layer_probe:
+                torch.cuda.synchronize()
+                _probe_alloc = torch.cuda.memory_allocated()
+                _probe_peak = torch.cuda.max_memory_allocated()
+                logger.info(
+                    f"[mem-profile/dsv4/layer_peak] rank={_probe_rank} "
+                    f"layer_idx={idx} "
+                    f"torch_alloc={_probe_alloc / (1 << 30):.2f}GiB "
+                    f"torch_alloc_peak={_probe_peak / (1 << 30):.2f}GiB"
+                )
+                torch.cuda.reset_peak_memory_stats()
+
+        if do_per_layer_probe:
+            self._mem_profile_first_forward_done = True
 
         hidden_states = hc_state.residual.flatten(1)
 
