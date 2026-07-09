@@ -646,7 +646,8 @@ class KVCacheManager(BaseResourceManager):
     def probe_prefix_match_length(self,
                                   input_tokens,
                                   lora_task_id=None,
-                                  cache_salt=None):
+                                  cache_salt=None,
+                                  conv_key=None):
         """Probe the KV cache radix tree for prefix match length.
 
         Returns the number of prefix tokens already cached on this rank.
@@ -656,6 +657,9 @@ class KVCacheManager(BaseResourceManager):
         namespace that ``_create_kv_cache`` uses; without it, salted
         requests would be probed against the salt=None namespace and the
         router would see the wrong match length.
+
+        ``conv_key`` is accepted for interface parity with the v2 adapter
+        (per-conversation probe cache) and ignored here.
         """
         if not self.enable_block_reuse:
             return 0

@@ -975,6 +975,20 @@ class KVCacheManagerV2(BaseResourceManager):
         self.enable_partial_reuse = kv_cache_config.enable_partial_reuse
         self.disk_prefetch_num_reqs = kv_cache_config.disk_prefetch_num_reqs
 
+        # Optional per-conversation probe cache: maps a conversation key to
+        # the committed block-key chain of the latest request in that
+        # conversation, so the reuse match (router probe and allocation-time
+        # match) can walk the radix tree by dict lookups instead of re-hashing
+        # the whole prefix (the SHA256 chain dominates match cost at long
+        # ISL). Gated by TRTLLM_KVV2_CONV_PROBE_CACHE: "0" (default) off;
+        # "1" on; "shadow" runs hinted + full probe, logs mismatches, and
+        # returns the full-probe result.
+        self._conv_probe_cache_mode = os.environ.get("TRTLLM_KVV2_CONV_PROBE_CACHE", "0")
+        self._conv_probe_cache: OrderedDict[tuple, list[bytes]] = OrderedDict()
+        self._conv_probe_cache_max_entries = int(
+            os.environ.get("TRTLLM_KVV2_CONV_PROBE_CACHE_MAX_ENTRIES", "8192")
+        )
+
         # With pipeline parallelism, multiple microbatches can be in-flight
         # simultaneously, so we need slots for all concurrent sequences.
         # Plus 1 for cuda graph dummy request.
@@ -1946,6 +1960,7 @@ class KVCacheManagerV2(BaseResourceManager):
                     cache_salt=req.cache_salt,
                     is_dummy=req.is_dummy,
                     expected_prompt_length=req.prompt_len - 1,
+                    conv_key=self._conv_probe_key(req),
                 )
                 if kv_cache is None:
                     return False
@@ -2768,6 +2783,7 @@ class KVCacheManagerV2(BaseResourceManager):
             self.impl.clear_stats_excluded(request.py_request_id)
             return
         kv_cache.discard_pending_stats()
+        self._store_conv_probe_keys(request, kv_cache)
         kv_cache.close()
         self.impl.clear_stats_excluded(request.py_request_id)
         if request.py_request_id in self._early_freed_index_requests:
@@ -3116,6 +3132,7 @@ class KVCacheManagerV2(BaseResourceManager):
         cache_salt: str | None = None,
         is_dummy: bool = False,
         expected_prompt_length: int | None = None,
+        conv_key=None,
     ):
         assert request_id not in self.kv_cache_map, (
             f"KV cache for request {request_id} already exists"
@@ -3131,11 +3148,20 @@ class KVCacheManagerV2(BaseResourceManager):
             )
             return None
         salt_int = self._derive_reuse_salt(cache_salt)
+        # Accelerates the allocation-time reuse match without changing its
+        # result: the hint keys are verified against input_tokens block by
+        # block inside the match (see match_with_key_hint).
+        reuse_block_key_hint = (
+            self._conv_probe_block_keys(conv_key, lora_task_id, cache_salt)
+            if input_tokens is not None
+            else None
+        )
         kv_cache = self.impl.create_kv_cache(
             ReuseScope(lora_id=lora_task_id, salt=salt_int),
             input_tokens,
             id=request_id,
             expected_prompt_length=expected_prompt_length,
+            reuse_block_key_hint=reuse_block_key_hint,
         )
         self.kv_cache_map[request_id] = kv_cache
         if is_dummy:
@@ -3150,7 +3176,7 @@ class KVCacheManagerV2(BaseResourceManager):
                 kv_cache.set_base_page_index_buf(i, pool_idx, memoryview(buffer.numpy()))
         return kv_cache
 
-    def probe_prefix_match_length(self, input_tokens, lora_task_id=None, cache_salt=None):
+    def probe_prefix_match_length(self, input_tokens, lora_task_id=None, cache_salt=None, conv_key=None):
         """Probe the v2 KV cache radix tree for prefix match length.
 
         Returns the number of prefix tokens already cached on this rank,
@@ -3161,16 +3187,83 @@ class KVCacheManagerV2(BaseResourceManager):
         ``_create_kv_cache``; the salt is derived from the ``cache_salt``
         string the same way, so the probe queries the same reuse namespace.
         Otherwise the router would see an incorrect match length.
+
+        ``conv_key`` optionally enables the per-conversation probe cache
+        (TRTLLM_KVV2_CONV_PROBE_CACHE): when the previous request of the same
+        conversation left its committed block-key chain behind, the probe
+        verifies those keys against ``input_tokens`` block by block (one dict
+        lookup + one list compare each) instead of hashing the prefix, and
+        only hashes the unseen suffix. The result is exactly the full
+        probe's; an edited history merely stops the accelerated prefix early
+        and falls back to hashing from that point.
         """
         if not self.enable_block_reuse:
             return 0
         if not input_tokens:
             return 0
         salt_int = self._derive_reuse_salt(cache_salt)
-        return self.impl.probe_reuse(
-            ReuseScope(lora_id=lora_task_id, salt=salt_int),
-            input_tokens,
-        )
+        reuse_scope = ReuseScope(lora_id=lora_task_id, salt=salt_int)
+        block_keys = self._conv_probe_block_keys(conv_key, lora_task_id, cache_salt)
+        if block_keys is not None:
+            fast_len = self.impl.probe_reuse(reuse_scope, input_tokens, block_key_hint=block_keys)
+            if self._conv_probe_cache_mode == "shadow":
+                full_len = self.impl.probe_reuse(reuse_scope, input_tokens)
+                if full_len != fast_len:
+                    logger.warning(
+                        f"[conv_probe_cache] shadow mismatch conv={conv_key}: "
+                        f"fast={fast_len} full={full_len}"
+                    )
+                return full_len
+            return fast_len
+        return self.impl.probe_reuse(reuse_scope, input_tokens)
+
+    @staticmethod
+    def _conv_probe_key(request: LlmRequest):
+        """Conversation key for the probe cache.
+
+        Read from ``py_disaggregated_params.conversation_id`` — the same
+        serve-side field conversation-aware routing uses — so both features
+        share one propagation path. Returns None when absent.
+        """
+        disagg_params = getattr(request, "py_disaggregated_params", None)
+        if disagg_params is None:
+            return None
+        conv_id = getattr(disagg_params, "conversation_id", None)
+        return conv_id if conv_id else None
+
+    def _conv_probe_block_keys(self, conv_key, lora_task_id, cache_salt):
+        """Look up (and LRU-touch) the cached block-key chain, or None."""
+        if conv_key is None or self._conv_probe_cache_mode == "0":
+            return None
+        cache_key = (conv_key, lora_task_id, cache_salt)
+        block_keys = self._conv_probe_cache.get(cache_key)
+        if block_keys is not None:
+            self._conv_probe_cache.move_to_end(cache_key)
+        return block_keys
+
+    def _store_conv_probe_keys(self, request: LlmRequest, kv_cache) -> None:
+        """Remember the committed block-key chain for this conversation.
+
+        Called on request free, when commit has already computed every block
+        key, so this is hashing-free. The next request of the same
+        conversation re-probes / re-matches via the block-key hint.
+        """
+        if self._conv_probe_cache_mode == "0":
+            return
+        if self.is_draft or not self.enable_block_reuse or request.is_dummy_request:
+            return
+        conv_key = self._conv_probe_key(request)
+        if conv_key is None:
+            return
+        block_keys = kv_cache.committed_block_keys()
+        if not block_keys:
+            return
+        cache = self._conv_probe_cache
+        cache_key = (conv_key, request.lora_task_id, request.cache_salt)
+        cache[cache_key] = block_keys
+        cache.move_to_end(cache_key)
+        while len(cache) > self._conv_probe_cache_max_entries:
+            cache.popitem(last=False)
 
     def prefetch_for_context_tokens(self, requests: list) -> bool:
         """Prefetch radix-tree blocks from disk→host for upcoming context requests.

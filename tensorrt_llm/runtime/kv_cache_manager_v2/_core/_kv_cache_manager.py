@@ -21,7 +21,7 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING, Iterable, Iterator, cast
 
 from .. import rawref
-from .._block_radix_tree import BlockRadixTree, ReuseMatch, ReuseScope
+from .._block_radix_tree import BlockKey, BlockRadixTree, ReuseMatch, ReuseScope
 from .._common import (
     BAD_PAGE_INDEX,
     GPU_LEVEL,
@@ -387,12 +387,16 @@ class KVCacheManager:
         custom_priority_callback: Callable[[BlockOrdinal, LifeCycle], Priority] = lambda _,
         __: PRIORITY_DEFAULT,
         expected_prompt_length: int | None = None,
+        reuse_block_key_hint: Sequence[BlockKey] | None = None,
     ) -> _KVCache:
         """
         reuse_scope: namespace to match before matching any tokens.
         custom_priority_callback: takes block index and layer sliding window size, returns priority.
         If priority returned is higher than existing priority for reused blocks, the block priority is updated.
         expected_prompt_length: optional prompt length hint used to size SWA scratch slots.
+        reuse_block_key_hint: optional committed block keys of an earlier request over the same
+        prefix (see _KVCache.committed_block_keys); accelerates the reuse match without changing
+        its result (keys are verified against input_tokens block by block).
         Newly created KV cache is suspended. You need to call resume() with a cuda stream to make it active
         & ready in that stream.
         Returns None if suspended=False and we don't have enough resource.
@@ -404,7 +408,8 @@ class KVCacheManager:
             reuse_scope = ReuseScope()
         assert type(reuse_scope) is ReuseScope
         reuse_match = (
-            self._match_reuse(reuse_scope, input_tokens) if input_tokens is not None else None
+            self._match_reuse(reuse_scope, input_tokens, reuse_block_key_hint)
+            if input_tokens is not None else None
         )
         if expected_prompt_length is None and input_tokens is not None:
             expected_prompt_length = len(input_tokens)
@@ -418,26 +423,59 @@ class KVCacheManager:
         )
 
     def _match_reuse(
-        self, reuse_scope: ReuseScope, input_tokens: Sequence[TokenIdExt]
+        self,
+        reuse_scope: ReuseScope,
+        input_tokens: Sequence[TokenIdExt],
+        block_key_hint: Sequence[BlockKey] | None = None,
     ) -> ReuseMatch:
+        if block_key_hint:
+            return self._radix_tree.match_with_key_hint(
+                reuse_scope, input_tokens, block_key_hint, self.enable_partial_match
+            )
         return self._radix_tree.match(reuse_scope, input_tokens, self.enable_partial_match)
 
     def probe_reuse(
         self,
         reuse_scope: ReuseScope | None = None,
         input_tokens: Sequence[TokenIdExt] | None = None,
+        block_key_hint: Sequence[BlockKey] | None = None,
     ) -> int:
         """
         Return the currently reusable prefix length without holding pages.
 
         The returned length is advisory because no page ownership is acquired.
+        ``block_key_hint`` (see create_kv_cache) accelerates the match without
+        changing its result.
         """
         if reuse_scope is None:
             reuse_scope = ReuseScope()
         assert type(reuse_scope) is ReuseScope
         if input_tokens is None:
             input_tokens = ()
-        return self._match_reuse(reuse_scope, input_tokens).num_tokens
+        return self._match_reuse(reuse_scope, input_tokens, block_key_hint).num_tokens
+
+    def probe_reuse_by_keys(
+        self,
+        reuse_scope: ReuseScope | None = None,
+        block_keys: Sequence[BlockKey] | None = None,
+    ) -> int:
+        """
+        :meth:`probe_reuse` variant that walks precomputed block keys instead of
+        hashing tokens.
+
+        ``block_keys`` is typically obtained from
+        :meth:`_KVCache.committed_block_keys` of an earlier request whose token
+        sequence is a prefix of the new request. The returned length is advisory
+        because no page ownership is acquired, and it reflects the CACHED
+        content: callers are responsible for knowing that the new request's
+        prefix is unchanged (or treating the result as a routing hint only).
+        """
+        if reuse_scope is None:
+            reuse_scope = ReuseScope()
+        assert type(reuse_scope) is ReuseScope
+        if not block_keys:
+            return 0
+        return self._radix_tree.match_block_keys(reuse_scope, block_keys).num_tokens
 
     def resize(self, cache_level: CacheLevel, quota: int, best_efforts: bool = False) -> bool:
         """

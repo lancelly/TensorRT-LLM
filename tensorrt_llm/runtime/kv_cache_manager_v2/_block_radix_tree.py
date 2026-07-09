@@ -122,6 +122,14 @@ def sequence_to_blockchain_keys(
 ) -> Iterator[tuple[TokenBlock, BlockKey]]:
     digest = Hasher(reuse_scope.to_bytes()).digest
     yield [], digest
+    yield from sequence_to_blockchain_keys_from(tokens_per_block, digest, tokens)
+
+
+def sequence_to_blockchain_keys_from(
+    tokens_per_block: int, digest: BlockKey, tokens: Sequence[TokenIdExt]
+) -> Iterator[tuple[TokenBlock, BlockKey]]:
+    """Continue an existing block-key chain: ``digest`` is the key of the block
+    (or reuse-scope root) preceding ``tokens``."""
     for token_block in chunked(tokens, tokens_per_block):
         digest = Hasher(digest).update(token_block).digest
         yield token_block, digest
@@ -506,26 +514,40 @@ class BlockRadixTree:
         tokens: Sequence[TokenIdExt],
         enable_partial_match: bool = False,
     ) -> Iterator[tuple[Block, int]]:
-        block: Block | RootBlock | BlockRadixTree = self
+        root_key = RootBlock.make_key(reuse_scope)
+        root = self.next.get(root_key)
+        if root is None:
+            return
+        yield from self._match_token_path_from(root, root_key, tokens, enable_partial_match)
+
+    # Continues a match mid-chain: ``block`` is the last already-matched block
+    # (or the RootBlock), ``prev_key`` its key, and ``tokens`` the remaining
+    # suffix. Same yield contract as _match_token_path.
+    def _match_token_path_from(
+        self,
+        block: "Block | RootBlock",
+        prev_key: BlockKey,
+        tokens: Sequence[TokenIdExt],
+        enable_partial_match: bool = False,
+    ) -> Iterator[tuple[Block, int]]:
+        node: Block | RootBlock = block
         mismatched_token_block: TokenBlock = []
-        for token_block, key in sequence_to_blockchain_keys(
-            self._tokens_per_block, reuse_scope, tokens
+        for token_block, key in sequence_to_blockchain_keys_from(
+            self._tokens_per_block, prev_key, tokens
         ):
-            if key in block.next:
-                block = block.next[key]
-                if token_block:
-                    assert isinstance(block, Block)
-                    yield block, len(token_block)
+            if key in node.next:
+                node = node.next[key]
+                assert isinstance(node, Block)
+                yield node, len(token_block)
             else:
                 mismatched_token_block = token_block
                 break
         if mismatched_token_block and enable_partial_match:
             partial_block, match_len = find_best_partial_match_in_next_nodes(
-                cast(Block | RootBlock, block), mismatched_token_block
+                node, mismatched_token_block
             )
             if partial_block is not None:
-                block = partial_block
-                yield block, match_len
+                yield partial_block, match_len
 
     def _prune_match(self, matched: list[tuple[Block, int]]) -> list[tuple[Block, int]]:
         tokens_per_block = self._tokens_per_block
@@ -615,6 +637,79 @@ class BlockRadixTree:
         matched = self._prune_match(
             list(self._match_token_path(reuse_scope, tokens, enable_partial_match))
         )
+        return ReuseMatch([block for block, _ in matched], self._num_matched_tokens(matched))
+
+    def match_with_key_hint(
+        self,
+        reuse_scope: ReuseScope,
+        tokens: Sequence[TokenIdExt],
+        block_keys: Sequence[BlockKey],
+        enable_partial_match: bool = False,
+    ) -> ReuseMatch:
+        """
+        Exact equivalent of :meth:`match` that uses previously committed block
+        keys as an accelerator.
+
+        For each hint key, a child-dict lookup replaces hashing one block of
+        ``tokens``, and the candidate block is accepted only if its stored
+        tokens equal the corresponding slice of ``tokens`` — a matching key
+        with matching content is necessarily the same node the hash walk would
+        find, while a stale hint (e.g. an edited conversation history) simply
+        stops the accelerated prefix. Matching then continues with the normal
+        hash walk over the remaining suffix, so the result is identical to
+        ``match(reuse_scope, tokens, enable_partial_match)``; only the hashing
+        cost changes (verified prefix: one list compare per block).
+        """
+        tokens_per_block = self._tokens_per_block
+        matched: list[tuple[Block, int]] = []
+        prev_key = RootBlock.make_key(reuse_scope)
+        node: Block | RootBlock | None = self.next.get(prev_key)
+        if node is None:
+            return ReuseMatch([], 0)
+        pos = 0
+        for key in block_keys:
+            if pos + tokens_per_block > len(tokens):
+                break
+            child = node.next.get(key)
+            if child is None:
+                break
+            block_tokens = child.tokens
+            if (len(block_tokens) != tokens_per_block
+                    or block_tokens != tokens[pos : pos + tokens_per_block]):
+                break
+            matched.append((child, tokens_per_block))
+            node, prev_key, pos = child, key, pos + tokens_per_block
+        matched.extend(
+            self._match_token_path_from(node, prev_key, tokens[pos:], enable_partial_match)
+        )
+        matched = self._prune_match(matched)
+        return ReuseMatch([block for block, _ in matched], self._num_matched_tokens(matched))
+
+    def match_block_keys(self, reuse_scope: ReuseScope, block_keys: Sequence[BlockKey]) -> ReuseMatch:
+        """
+        Return the currently reusable prefix match by walking precomputed block keys.
+
+        Equivalent to :meth:`match` for an unchanged token prefix, but skips token
+        hashing entirely: each key is a plain child-dict lookup on the previous
+        block. Intended for callers that cached the committed block-key chain of
+        an earlier request over the same prefix (e.g. a per-conversation probe
+        cache). Because block keys are chained content hashes, a matched key
+        implies the whole prefix up to that block matches the cached content; it
+        does NOT re-verify the new request's tokens against that content.
+
+        The result is volatile, same as :meth:`match`.
+        """
+        matched: list[tuple[Block, int]] = []
+        root = self.next.get(RootBlock.make_key(reuse_scope))
+        if root is not None:
+            block: RootBlock | Block = root
+            for key in block_keys:
+                child = block.next.get(key)
+                if child is None:
+                    break
+                matched.append((child, len(child.tokens)))
+                block = child
+        matched = self._prune_match(matched)
         return ReuseMatch([block for block, _ in matched], self._num_matched_tokens(matched))
 
     def _check_sanity(self) -> bool:
