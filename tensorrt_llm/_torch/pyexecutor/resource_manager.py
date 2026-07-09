@@ -2832,11 +2832,11 @@ class KVCacheManagerV2(BaseResourceManager):
         ``conv_key`` optionally enables the per-conversation probe cache
         (TRTLLM_KVV2_CONV_PROBE_CACHE): when the previous request of the
         same conversation left its committed block-key chain behind, the
-        probe walks those keys with plain dict lookups instead of hashing
-        ``input_tokens``. The fast path assumes the conversation history is
-        append-only; an edited history can over-report until the entry is
-        refreshed, which is acceptable for a routing hint (allocation-time
-        matching remains authoritative).
+        probe verifies those keys against ``input_tokens`` block by block
+        (one dict lookup + one list compare each) instead of hashing the
+        prefix, and only hashes the unseen suffix. The result is exactly
+        the full probe's; an edited history merely stops the accelerated
+        prefix early and falls back to hashing from that point.
         """
         if not self.enable_block_reuse:
             return 0
@@ -2845,28 +2845,30 @@ class KVCacheManagerV2(BaseResourceManager):
         from tensorrt_llm.runtime.kv_cache_manager_v2._block_radix_tree import \
             ReuseScope
         reuse_scope = ReuseScope(lora_id=lora_task_id, salt=cache_salt_id)
-        mode = self._conv_probe_cache_mode
-        if conv_key is not None and mode != "0":
-            cache_key = (conv_key, lora_task_id, cache_salt_id)
-            block_keys = self._conv_probe_cache.get(cache_key)
-            if block_keys is not None:
-                self._conv_probe_cache.move_to_end(cache_key)
-                fast_len = min(
-                    self.impl.probe_reuse_by_keys(reuse_scope, block_keys),
-                    len(input_tokens))
-                if mode == "shadow":
-                    full_len = self.impl.probe_reuse(reuse_scope, input_tokens)
-                    if full_len != fast_len:
-                        logger.debug(
-                            f"[conv_probe_cache] shadow mismatch conv={conv_key}: "
-                            f"fast={fast_len} full={full_len}")
-                    return full_len
-                if fast_len > 0:
-                    return fast_len
-                # Cached chain found nothing (evicted or stale). Fall through:
-                # the full probe can still find cross-conversation shared
-                # prefixes (e.g. a common system prompt).
+        block_keys = self._conv_probe_block_keys(conv_key, lora_task_id,
+                                                 cache_salt_id)
+        if block_keys is not None:
+            fast_len = self.impl.probe_reuse(reuse_scope, input_tokens,
+                                             block_key_hint=block_keys)
+            if self._conv_probe_cache_mode == "shadow":
+                full_len = self.impl.probe_reuse(reuse_scope, input_tokens)
+                if full_len != fast_len:
+                    logger.warning(
+                        f"[conv_probe_cache] shadow mismatch conv={conv_key}: "
+                        f"fast={fast_len} full={full_len}")
+                return full_len
+            return fast_len
         return self.impl.probe_reuse(reuse_scope, input_tokens)
+
+    def _conv_probe_block_keys(self, conv_key, lora_task_id, cache_salt_id):
+        """Look up (and LRU-touch) the cached block-key chain, or None."""
+        if conv_key is None or self._conv_probe_cache_mode == "0":
+            return None
+        cache_key = (conv_key, lora_task_id, cache_salt_id)
+        block_keys = self._conv_probe_cache.get(cache_key)
+        if block_keys is not None:
+            self._conv_probe_cache.move_to_end(cache_key)
+        return block_keys
 
     @staticmethod
     def _conv_probe_key(request: LlmRequest):
@@ -3043,7 +3045,8 @@ class KVCacheManagerV2(BaseResourceManager):
                     tokens,
                     cache_salt_id=req.cache_salt_id,
                     is_dummy=req.is_dummy,
-                    expected_prompt_length=req.prompt_len - 1)
+                    expected_prompt_length=req.prompt_len - 1,
+                    conv_key=self._conv_probe_key(req))
                 if kv_cache is None:
                     return False
                 kv_cache.cuda_stream = self._stream.cuda_stream
@@ -4183,7 +4186,8 @@ class KVCacheManagerV2(BaseResourceManager):
                          *,
                          cache_salt_id: int | None = None,
                          is_dummy: bool = False,
-                         expected_prompt_length: int | None = None):
+                         expected_prompt_length: int | None = None,
+                         conv_key=None):
         assert request_id not in self.kv_cache_map, f"KV cache for request {request_id} already exists"
         if self.index_mapper.num_free_slots() == 0:
             logger.warning(
@@ -4192,11 +4196,18 @@ class KVCacheManagerV2(BaseResourceManager):
                 "Skipping KV cache creation; request will retry next iteration.",
                 request_id, self.index_mapper.size(), self.index_mapper.size())
             return None
+        # Accelerates the allocation-time reuse match without changing its
+        # result: the hint keys are verified against input_tokens block by
+        # block inside the match (see match_with_key_hint).
+        reuse_block_key_hint = (self._conv_probe_block_keys(
+            conv_key, lora_task_id, cache_salt_id)
+                                if input_tokens is not None else None)
         kv_cache = self.impl.create_kv_cache(
             ReuseScope(lora_id=lora_task_id, salt=cache_salt_id),
             input_tokens,
             id=request_id,
             expected_prompt_length=expected_prompt_length,
+            reuse_block_key_hint=reuse_block_key_hint,
         )
         self.kv_cache_map[request_id] = kv_cache
         if is_dummy:

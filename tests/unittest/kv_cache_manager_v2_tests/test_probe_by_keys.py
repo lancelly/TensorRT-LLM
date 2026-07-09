@@ -124,5 +124,79 @@ class TestMatchBlockKeys(unittest.TestCase):
         self.assertEqual(result.num_tokens, 0)
 
 
+class TestMatchWithKeyHint(unittest.TestCase):
+    """match_with_key_hint must be exactly equivalent to match() — the hint
+    only replaces hashing with dict lookups + token verification."""
+
+    def setUp(self) -> None:
+        self.tree = BlockRadixTree(cast(LifeCycleRegistry, _EmptyLifeCycles()), tokens_per_block=TPB)
+        self.scope = ReuseScope(lora_id=7, salt=11)
+        self.tokens = [TokenId(t) for t in (1, 2, 3, 4, 5, 6)]
+        root = self.tree.add_or_get_existing(self.scope)
+        self.blocks: list[Block] = []
+        prev: object = root
+        for beg in range(0, len(self.tokens), TPB):
+            block = Block(self.tokens[beg : beg + TPB], prev)
+            self.blocks.append(block)
+            prev = block
+        self.hint = [block.key for block in self.blocks]
+
+    def _assert_parity(self, tokens, hint, enable_partial_match=False) -> None:
+        expected = self.tree.match(self.scope, tokens, enable_partial_match)
+        result = self.tree.match_with_key_hint(self.scope, tokens, hint, enable_partial_match)
+        self.assertEqual(result.blocks, expected.blocks)
+        self.assertEqual(result.num_tokens, expected.num_tokens)
+
+    def test_unchanged_prefix_full_parity(self) -> None:
+        self._assert_parity(self.tokens, self.hint)
+        result = self.tree.match_with_key_hint(self.scope, self.tokens, self.hint)
+        self.assertEqual(result.num_tokens, len(self.tokens))
+
+    def test_suffix_beyond_hint_is_hash_matched(self) -> None:
+        # A later request already committed one more block; the hint only
+        # covers the first three — the suffix must still match via hashing.
+        extra = [TokenId(7), TokenId(8)]
+        extra_block = Block(extra, self.blocks[-1])
+        self._assert_parity(self.tokens + extra, self.hint)
+        result = self.tree.match_with_key_hint(self.scope, self.tokens + extra, self.hint)
+        self.assertEqual(result.blocks[-1], extra_block)
+        self.assertEqual(result.num_tokens, len(self.tokens) + len(extra))
+
+    def test_edited_history_is_detected_by_verification(self) -> None:
+        # Block 1's content changed: the stale hint key still exists in the
+        # tree, but verification against the new tokens must reject it.
+        edited = list(self.tokens)
+        edited[2] = TokenId(99)
+        self._assert_parity(edited, self.hint)
+        result = self.tree.match_with_key_hint(self.scope, edited, self.hint)
+        self.assertEqual(result.blocks, self.blocks[:1])
+        self.assertEqual(result.num_tokens, TPB)
+
+    def test_truncated_history_stops_at_token_end(self) -> None:
+        self._assert_parity(self.tokens[:3], self.hint)
+
+    def test_partial_tail_via_suffix_walk(self) -> None:
+        # Tokens end mid-block; the partial match runs in the suffix
+        # continuation, after the verified prefix.
+        tokens = self.tokens[:5]
+        self._assert_parity(tokens, self.hint, enable_partial_match=True)
+        result = self.tree.match_with_key_hint(self.scope, tokens, self.hint, True)
+        self.assertEqual(result.num_tokens, 5)
+
+    def test_removed_subtree_falls_back_to_hashing(self) -> None:
+        remove_subtree(self.blocks[1])
+        self._assert_parity(self.tokens, self.hint)
+        result = self.tree.match_with_key_hint(self.scope, self.tokens, self.hint)
+        self.assertEqual(result.blocks, self.blocks[:1])
+
+    def test_empty_hint_equals_plain_match(self) -> None:
+        self._assert_parity(self.tokens, [])
+
+    def test_wrong_scope_matches_nothing(self) -> None:
+        result = self.tree.match_with_key_hint(ReuseScope(lora_id=7, salt=12), self.tokens, self.hint)
+        self.assertEqual(result.blocks, [])
+        self.assertEqual(result.num_tokens, 0)
+
+
 if __name__ == "__main__":
     unittest.main()

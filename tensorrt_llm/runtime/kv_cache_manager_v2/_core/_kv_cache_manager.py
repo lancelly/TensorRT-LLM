@@ -387,12 +387,16 @@ class KVCacheManager:
         custom_priority_callback: Callable[[BlockOrdinal, LifeCycle], Priority] = lambda _,
         __: PRIORITY_DEFAULT,
         expected_prompt_length: int | None = None,
+        reuse_block_key_hint: Sequence[BlockKey] | None = None,
     ) -> _KVCache:
         """
         reuse_scope: namespace to match before matching any tokens.
         expected_prompt_length: optional prompt length hint used to size SWA scratch slots.
         custom_priority_callback: takes block index and layer sliding window size, returns priority.
         If priority returned is higher than existing priority for reused blocks, the block priority is updated.
+        reuse_block_key_hint: optional committed block keys of an earlier request over the same
+        prefix (see _KVCache.committed_block_keys); accelerates the reuse match without changing
+        its result (keys are verified against input_tokens block by block).
         Newly created KV cache is suspended. You need to call resume() with a cuda stream to make it active
         & ready in that stream.
         Returns None if suspended=False and we don't have enough resource.
@@ -406,7 +410,8 @@ class KVCacheManager:
         if expected_prompt_length is None and input_tokens is not None:
             expected_prompt_length = len(input_tokens)
         reuse_match = (
-            self._match_reuse(reuse_scope, input_tokens) if input_tokens is not None else None
+            self._match_reuse(reuse_scope, input_tokens, reuse_block_key_hint)
+            if input_tokens is not None else None
         )
         return _KVCache(
             self,
@@ -418,26 +423,36 @@ class KVCacheManager:
         )
 
     def _match_reuse(
-        self, reuse_scope: ReuseScope, input_tokens: Sequence[TokenIdExt]
+        self,
+        reuse_scope: ReuseScope,
+        input_tokens: Sequence[TokenIdExt],
+        block_key_hint: Sequence[BlockKey] | None = None,
     ) -> ReuseMatch:
+        if block_key_hint:
+            return self._radix_tree.match_with_key_hint(
+                reuse_scope, input_tokens, block_key_hint, self.enable_partial_match
+            )
         return self._radix_tree.match(reuse_scope, input_tokens, self.enable_partial_match)
 
     def probe_reuse(
         self,
         reuse_scope: ReuseScope | None = None,
         input_tokens: Sequence[TokenIdExt] | None = None,
+        block_key_hint: Sequence[BlockKey] | None = None,
     ) -> int:
         """
         Return the currently reusable prefix length without holding pages.
 
         The returned length is advisory because no page ownership is acquired.
+        ``block_key_hint`` (see create_kv_cache) accelerates the match without
+        changing its result.
         """
         if reuse_scope is None:
             reuse_scope = ReuseScope()
         assert type(reuse_scope) is ReuseScope
         if input_tokens is None:
             input_tokens = ()
-        return self._match_reuse(reuse_scope, input_tokens).num_tokens
+        return self._match_reuse(reuse_scope, input_tokens, block_key_hint).num_tokens
 
     def probe_reuse_by_keys(
         self,

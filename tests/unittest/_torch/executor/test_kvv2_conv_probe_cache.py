@@ -114,50 +114,32 @@ class TestStoreConvProbeKeys:
 
 class TestProbeFastPath:
 
-    def test_hit_uses_by_keys_and_skips_hashing(self):
+    def test_hit_probes_with_key_hint(self):
         mgr = _make_manager()
         _store(mgr, [b"k0", b"k1"])
-        mgr.impl.probe_reuse_by_keys.return_value = 256
+        mgr.impl.probe_reuse.return_value = 256
 
         result = mgr.probe_prefix_match_length(list(range(300)), conv_key=CONV)
 
         assert result == 256
-        mgr.impl.probe_reuse_by_keys.assert_called_once()
-        assert mgr.impl.probe_reuse_by_keys.call_args.args[1] == [b"k0", b"k1"]
-        mgr.impl.probe_reuse.assert_not_called()
-
-    def test_hit_is_clamped_to_probe_length(self):
-        mgr = _make_manager()
-        _store(mgr, [b"k0", b"k1"])
-        mgr.impl.probe_reuse_by_keys.return_value = 256
-
-        assert mgr.probe_prefix_match_length(list(range(100)), conv_key=CONV) == 100
-
-    def test_zero_fast_result_falls_back_to_full_probe(self):
-        # The cached chain may be fully evicted while a cross-conversation
-        # shared prefix (e.g. common system prompt) still matches.
-        mgr = _make_manager()
-        _store(mgr, [b"k0"])
-        mgr.impl.probe_reuse_by_keys.return_value = 0
-        mgr.impl.probe_reuse.return_value = 64
-
-        assert mgr.probe_prefix_match_length(list(range(100)), conv_key=CONV) == 64
         mgr.impl.probe_reuse.assert_called_once()
+        assert mgr.impl.probe_reuse.call_args.kwargs["block_key_hint"] == [b"k0", b"k1"]
 
-    def test_miss_uses_full_probe(self):
+    def test_miss_probes_without_hint(self):
         mgr = _make_manager()
         mgr.impl.probe_reuse.return_value = 128
 
         assert mgr.probe_prefix_match_length(list(range(300)), conv_key=CONV) == 128
-        mgr.impl.probe_reuse_by_keys.assert_not_called()
+        mgr.impl.probe_reuse.assert_called_once()
+        assert "block_key_hint" not in mgr.impl.probe_reuse.call_args.kwargs
 
-    def test_no_conv_key_uses_full_probe(self):
+    def test_no_conv_key_probes_without_hint(self):
         mgr = _make_manager()
         _store(mgr, [b"k0"])
         mgr.impl.probe_reuse.return_value = 128
 
         assert mgr.probe_prefix_match_length(list(range(300))) == 128
-        mgr.impl.probe_reuse_by_keys.assert_not_called()
+        assert "block_key_hint" not in mgr.impl.probe_reuse.call_args.kwargs
 
     def test_disabled_mode_ignores_conv_key(self):
         mgr = _make_manager(mode="0")
@@ -165,17 +147,18 @@ class TestProbeFastPath:
         mgr.impl.probe_reuse.return_value = 128
 
         assert mgr.probe_prefix_match_length(list(range(300)), conv_key=CONV) == 128
-        mgr.impl.probe_reuse_by_keys.assert_not_called()
+        assert "block_key_hint" not in mgr.impl.probe_reuse.call_args.kwargs
 
     def test_shadow_mode_runs_both_and_returns_full(self):
         mgr = _make_manager(mode="shadow")
         _store(mgr, [b"k0", b"k1"])
-        mgr.impl.probe_reuse_by_keys.return_value = 256
-        mgr.impl.probe_reuse.return_value = 200
+        mgr.impl.probe_reuse.side_effect = [256, 200]  # hinted, then full
 
         assert mgr.probe_prefix_match_length(list(range(300)), conv_key=CONV) == 200
-        mgr.impl.probe_reuse_by_keys.assert_called_once()
-        mgr.impl.probe_reuse.assert_called_once()
+        assert mgr.impl.probe_reuse.call_count == 2
+        first, second = mgr.impl.probe_reuse.call_args_list
+        assert first.kwargs["block_key_hint"] == [b"k0", b"k1"]
+        assert "block_key_hint" not in second.kwargs
 
     def test_block_reuse_disabled_short_circuits(self):
         mgr = _make_manager(enable_block_reuse=False)
@@ -186,8 +169,35 @@ class TestProbeFastPath:
         mgr = _make_manager(max_entries=2)
         _store(mgr, [b"k0"], conv_id="a")
         _store(mgr, [b"k0"], conv_id="b")
-        mgr.impl.probe_reuse_by_keys.return_value = 1
+        mgr.impl.probe_reuse.return_value = 1
 
         mgr.probe_prefix_match_length([1, 2], conv_key="a")  # touch "a"
         _store(mgr, [b"k0"], conv_id="c")  # evicts "b", not "a"
         assert set(mgr._conv_probe_cache) == {("a", None, None), ("c", None, None)}
+
+
+class TestConvProbeBlockKeysHelper:
+
+    def test_returns_keys_and_touches_lru(self):
+        mgr = _make_manager(max_entries=2)
+        _store(mgr, [b"k0"], conv_id="a")
+        _store(mgr, [b"k0"], conv_id="b")
+
+        assert mgr._conv_probe_block_keys("a", None, None) == [b"k0"]
+        _store(mgr, [b"k0"], conv_id="c")  # evicts "b", not the touched "a"
+        assert set(mgr._conv_probe_cache) == {("a", None, None), ("c", None, None)}
+
+    def test_none_without_key_entry_or_when_disabled(self):
+        mgr = _make_manager()
+        assert mgr._conv_probe_block_keys(None, None, None) is None
+        assert mgr._conv_probe_block_keys(CONV, None, None) is None
+
+        disabled = _make_manager(mode="0")
+        disabled._conv_probe_cache[(CONV, None, None)] = [b"k0"]
+        assert disabled._conv_probe_block_keys(CONV, None, None) is None
+
+    def test_scope_mismatch_returns_none(self):
+        mgr = _make_manager()
+        _store(mgr, [b"k0"], lora_task_id=3, cache_salt_id=5)
+        assert mgr._conv_probe_block_keys(CONV, None, None) is None
+        assert mgr._conv_probe_block_keys(CONV, 3, 5) == [b"k0"]

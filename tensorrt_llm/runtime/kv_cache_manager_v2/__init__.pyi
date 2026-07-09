@@ -444,11 +444,14 @@ class KVCacheManager:
         input_tokens: Sequence[TokenIdExt] | None = None,
         id: Any = None,
         custom_priority_callback: Callable[[int, Any], Priority] = ...,
+        expected_prompt_length: int | None = None,
+        reuse_block_key_hint: Sequence[bytes] | None = None,
     ) -> _KVCache: ...
     def probe_reuse(
         self,
         reuse_scope: ReuseScope | None = None,
         input_tokens: Sequence[TokenIdExt] | None = None,
+        block_key_hint: Sequence[bytes] | None = None,
     ) -> int: ...
     def probe_reuse_by_keys(
         self,
