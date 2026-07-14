@@ -146,11 +146,15 @@ static nb::tuple bufferIdTuple(kv::BufferId const& self)
 
 static nb::object optionalIntToObject(std::optional<int64_t> value)
 {
+    // IDs and salts cross this boundary as two's-complement-wrapped uint64
+    // (Python ints such as CUDA_GRAPH_DUMMY_REQUEST_ID = 2**64-1 or sha256-
+    // derived salts exceed int64). Reinterpret back so Python sees the
+    // original value.
     if (!value.has_value())
     {
         return nb::none();
     }
-    return nb::cast(*value);
+    return nb::cast(static_cast<uint64_t>(*value));
 }
 
 static nb::tuple reuseScopeTuple(kv::ReuseScope const& self)
@@ -433,7 +437,7 @@ static nb::object castRequestIds(std::unordered_set<int64_t> const& requestIds)
     nb::object result = nb::module_::import_("builtins").attr("set")();
     for (int64_t const requestId : requestIds)
     {
-        result.attr("add")(requestId);
+        result.attr("add")(static_cast<uint64_t>(requestId));
     }
     return result;
 }
@@ -449,7 +453,10 @@ static std::optional<int64_t> castOptionalIntAttr(nb::handle obj, char const* at
     {
         return std::nullopt;
     }
-    return nb::cast<int64_t>(attr);
+    // Accept the full uint64 range (sha256-derived salts, sentinel ids) and
+    // reinterpret as int64; ReuseScope::toBytes serializes the same 8 bytes
+    // either way, so reuse keys stay identical to the Python backend's.
+    return static_cast<int64_t>(nb::cast<uint64_t>(attr));
 }
 
 static kv::ReuseScope castReuseScope(nb::object reuseScope)
@@ -942,10 +949,17 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
 
     // ---- ReuseScope --------------------------------------------------------
     nb::class_<kv::ReuseScope>(m, "ReuseScope")
-        .def(nb::init<std::optional<int64_t>, std::optional<int64_t>>(), nb::arg("lora_id").none() = std::nullopt,
-            nb::arg("salt").none() = std::nullopt)
-        .def_ro("lora_id", &kv::ReuseScope::loraId)
-        .def_ro("salt", &kv::ReuseScope::salt)
+        .def(
+            "__init__",
+            [](kv::ReuseScope* self, std::optional<uint64_t> loraId, std::optional<uint64_t> salt)
+            {
+                new (self) kv::ReuseScope{
+                    loraId ? std::optional<int64_t>(static_cast<int64_t>(*loraId)) : std::nullopt,
+                    salt ? std::optional<int64_t>(static_cast<int64_t>(*salt)) : std::nullopt};
+            },
+            nb::arg("lora_id").none() = std::nullopt, nb::arg("salt").none() = std::nullopt)
+        .def_prop_ro("lora_id", [](kv::ReuseScope const& self) { return optionalIntToObject(self.loraId); })
+        .def_prop_ro("salt", [](kv::ReuseScope const& self) { return optionalIntToObject(self.salt); })
         .def("to_bytes",
             [](kv::ReuseScope const& self)
             {
@@ -1556,7 +1570,7 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
         .def(
             "create_kv_cache",
             [](std::shared_ptr<kv::KvCacheManager> self, nb::object reuseScopeObj, nb::object inputTokens,
-                std::optional<int64_t> id, nb::object customPriorityCallback, std::optional<int> expectedPromptLength)
+                std::optional<uint64_t> id, nb::object customPriorityCallback, std::optional<int> expectedPromptLength)
             {
                 kv::ReuseScope reuseScope = castReuseScope(std::move(reuseScopeObj));
                 std::vector<kv::TokenIdExt> tokens;
@@ -1571,8 +1585,9 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
                 }
                 kv::KvCache::PriorityCb priorityCb = castPriorityCallback(*self, std::move(customPriorityCallback));
                 nb::gil_scoped_release release;
-                return self->createKvCache(
-                    std::move(reuseScope), tokens, id, std::move(priorityCb), expectedPromptLength);
+                return self->createKvCache(std::move(reuseScope), tokens,
+                    id ? std::optional<int64_t>(static_cast<int64_t>(*id)) : std::nullopt, std::move(priorityCb),
+                    expectedPromptLength);
             },
             nb::arg("reuse_scope") = nb::none(), nb::arg("input_tokens") = nb::none(), nb::arg("id") = std::nullopt,
             nb::arg("custom_priority_callback") = nb::none(), nb::arg("expected_prompt_length") = std::nullopt)
@@ -1615,13 +1630,33 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
             [](kv::KvCacheManager& self, int cacheLevel)
             { return castPeakBlockStats(self.getAndResetIterationPeakBlockStats(kv::CacheLevel{cacheLevel})); },
             nb::arg("cache_level"))
-        .def("mark_stats_dirty", &kv::KvCacheManager::markStatsDirty, nb::arg("kv_cache_id").none())
-        .def("clear_stats_dirty", &kv::KvCacheManager::clearStatsDirty, nb::arg("kv_cache_id").none())
+        .def(
+            "mark_stats_dirty",
+            [](kv::KvCacheManager& self, std::optional<uint64_t> id)
+            { self.markStatsDirty(id ? std::optional<int64_t>(static_cast<int64_t>(*id)) : std::nullopt); },
+            nb::arg("kv_cache_id").none())
+        .def(
+            "clear_stats_dirty",
+            [](kv::KvCacheManager& self, std::optional<uint64_t> id)
+            { self.clearStatsDirty(id ? std::optional<int64_t>(static_cast<int64_t>(*id)) : std::nullopt); },
+            nb::arg("kv_cache_id").none())
         .def("get_dirty_stats_kv_cache_ids",
             [](kv::KvCacheManager const& self) { return castRequestIds(self.getDirtyStatsKvCacheIds()); })
-        .def("mark_stats_excluded", &kv::KvCacheManager::markStatsExcluded, nb::arg("kv_cache_id").none())
-        .def("clear_stats_excluded", &kv::KvCacheManager::clearStatsExcluded, nb::arg("kv_cache_id").none())
-        .def("is_stats_excluded", &kv::KvCacheManager::isStatsExcluded, nb::arg("kv_cache_id").none())
+        .def(
+            "mark_stats_excluded",
+            [](kv::KvCacheManager& self, std::optional<uint64_t> id)
+            { self.markStatsExcluded(id ? std::optional<int64_t>(static_cast<int64_t>(*id)) : std::nullopt); },
+            nb::arg("kv_cache_id").none())
+        .def(
+            "clear_stats_excluded",
+            [](kv::KvCacheManager& self, std::optional<uint64_t> id)
+            { self.clearStatsExcluded(id ? std::optional<int64_t>(static_cast<int64_t>(*id)) : std::nullopt); },
+            nb::arg("kv_cache_id").none())
+        .def(
+            "is_stats_excluded",
+            [](kv::KvCacheManager& self, std::optional<uint64_t> id)
+            { return self.isStatsExcluded(id ? std::optional<int64_t>(static_cast<int64_t>(*id)) : std::nullopt); },
+            nb::arg("kv_cache_id").none())
         .def_prop_ro("tokens_per_block", &kv::KvCacheManager::tokensPerBlock)
         .def_prop_ro("event_manager",
             [](kv::KvCacheManager const& self)
