@@ -1411,7 +1411,7 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
                 self.setBasePageIndexBuf(typedBeamIdx, typedLayerGroupId, static_cast<int32_t*>(view.buf),
                     static_cast<int>(view.len / sizeof(int32_t)));
             },
-            nb::arg("beam_idx"), nb::arg("layer_group_id"), nb::arg("buf"));
+            nb::arg("beam_idx"), nb::arg("layer_group_id"), nb::arg("buf").none());
 
     // Make Status accessible as _KVCache.Status.
     m.attr("_KVCache").attr("Status") = kvCacheStatus;

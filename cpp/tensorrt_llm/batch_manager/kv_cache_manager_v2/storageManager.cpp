@@ -114,7 +114,7 @@ TypedVec<LifeCycleId, TypedVec<PoolIndex, int>> computeSlotToPageIndices(Storage
 StorageManager::StorageManager(LifeCycleRegistry const& lifeCycles, StorageConfig const& config, int tokensPerBlock,
     std::optional<SwaScratchReuseConfig> swaScratchReuse, std::optional<BatchDesc> const& typicalBatch,
     std::vector<BatchDesc> const& constraints, std::optional<std::vector<float>> const& initialPoolRatio,
-    std::shared_ptr<EventSink> eventSink)
+    std::shared_ptr<EventSink> eventSink, float maxUtilForResume)
     : mLifeCycles(lifeCycles)
     , mEventSink(std::move(eventSink))
     , mStorageConfig(config)
@@ -160,9 +160,11 @@ StorageManager::StorageManager(LifeCycleRegistry const& lifeCycles, StorageConfi
     size_t gpuQuota = cacheTierQuota(config.cacheTiers[kGpuLevel]);
     size_t gpuGranularity = CacheLevelManager::cacheTierGranularity(CacheTier::GPU_MEM, gpuQuota);
 
-    // Explicit ratios override constraints for both initial sizing and minimum slot counts.
-    mMinSlots = computeMinSlotsFromConstraints(
-        initialPoolRatio.has_value() ? std::vector<BatchDesc>{} : constraints, tokensPerBlock, mSwaScratchReuse);
+    // Constraints stay feasibility floors even under an explicit initial pool
+    // ratio (a share below what a declared batch needs is clamped up), and the
+    // floors are scaled by 1/maxUtilForResume because _KVCache::resume rejects
+    // any pool group above that utilization. Mirrors PR#16269 on the Python side.
+    mMinSlots = computeMinSlotsFromConstraints(constraints, tokensPerBlock, mSwaScratchReuse, maxUtilForResume);
 
     // Compute init_ratio from explicit config, typical_batch, constraints, or fallback.
     TypedVec<PoolGroupIndex, float> initRatio;
@@ -1115,8 +1117,17 @@ TypedVec<PoolGroupIndex, float> StorageManager::ratioFromBatch(BatchDesc const& 
 
 TypedVec<PoolGroupIndex, SlotCount> StorageManager::computeMinSlotsFromConstraints(
     std::vector<BatchDesc> const& constraints, int tokensPerBlock,
-    std::optional<SwaScratchReuseConfig> const& swaScratchReuse) const
+    std::optional<SwaScratchReuseConfig> const& swaScratchReuse, float maxUtilForResume) const
 {
+    // The resume gate only binds for values in (0, 1): with 0 only the first
+    // resume of an empty pool passes, so no finite floor helps; values >= 1
+    // never trigger since utilization cannot exceed 1. Scale floors only in
+    // the binding range so 0 doesn't divide by zero and >1 doesn't shrink
+    // floors. Mirrors the Python _compute_min_slots_from_constraints.
+    if (!(maxUtilForResume > 0.0f && maxUtilForResume < 1.0f))
+    {
+        maxUtilForResume = 1.0f;
+    }
     // Default floor: 1 slot per life cycle in each pool group.
     TypedVec<PoolGroupIndex, SlotCount> maxSlots(numPoolGroups(), 0);
     for (auto pgIdx : mLifeCycleGrouping)
@@ -1126,7 +1137,9 @@ TypedVec<PoolGroupIndex, SlotCount> StorageManager::computeMinSlotsFromConstrain
         auto slots = computeSlotsForBatch(batch, tokensPerBlock, swaScratchReuse);
         for (PoolGroupIndex pgIdx{0}; pgIdx < slots.size(); ++pgIdx)
         {
-            maxSlots[pgIdx] = std::max(maxSlots[pgIdx], slots[pgIdx]);
+            auto const scaled = static_cast<SlotCount>(
+                std::ceil(static_cast<double>(slots[pgIdx]) / static_cast<double>(maxUtilForResume)));
+            maxSlots[pgIdx] = std::max(maxSlots[pgIdx], scaled);
         }
     }
     return maxSlots;

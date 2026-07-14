@@ -102,7 +102,7 @@ public:
         std::optional<SwaScratchReuseConfig> swaScratchReuse = std::nullopt,
         std::optional<BatchDesc> const& typicalBatch = std::nullopt, std::vector<BatchDesc> const& constraints = {},
         std::optional<std::vector<float>> const& initialPoolRatio = std::nullopt,
-        std::shared_ptr<EventSink> eventSink = nullptr);
+        std::shared_ptr<EventSink> eventSink = nullptr, float maxUtilForResume = 1.0f);
     ~StorageManager();
 
     StorageManager(StorageManager const&) = delete;
@@ -262,7 +262,8 @@ public:
 private:
     // Constraint-based partitioning helpers.
     TypedVec<PoolGroupIndex, SlotCount> computeMinSlotsFromConstraints(std::vector<BatchDesc> const& constraints,
-        int tokensPerBlock, std::optional<SwaScratchReuseConfig> const& swaScratchReuse) const;
+        int tokensPerBlock, std::optional<SwaScratchReuseConfig> const& swaScratchReuse,
+        float maxUtilForResume = 1.0f) const;
     TypedVec<PoolGroupIndex, SlotCount> computeSlotsForBatch(
         BatchDesc const& batch, int tokensPerBlock, std::optional<SwaScratchReuseConfig> const& swaScratchReuse) const;
     TypedVec<PoolGroupIndex, size_t> slotsToBytes(
