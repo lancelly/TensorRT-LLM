@@ -2208,6 +2208,10 @@ class KVCacheManager(BaseResourceManager):
         self.impl.reset_reuse_state()
 
 
+class NoFreeSlotsError(ValueError):
+    """A slot-backed resource manager has no capacity for another request."""
+
+
 class SlotManager:
 
     def __init__(self, max_num_requests: int):
@@ -2236,7 +2240,7 @@ class SlotManager:
             return self.slot_mapping[request_id]
 
         if len(self.free_slots) == 0:
-            raise ValueError("No free slots")
+            raise NoFreeSlotsError("No free slots")
         slot = self.free_slots.pop()
         self.slot_mapping[request_id] = slot
         return slot
