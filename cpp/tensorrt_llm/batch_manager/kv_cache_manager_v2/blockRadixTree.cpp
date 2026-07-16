@@ -25,6 +25,10 @@
 
 #include "tensorrt_llm/common/assert.h"
 #include <algorithm>
+#include <atomic>
+#include <chrono>
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <stdexcept>
 #include <utility>
@@ -126,13 +130,110 @@ Hasher& Hasher::update(TokenIdExt const& tokenExt)
     return *this;
 }
 
+namespace
+{
+// Optional precise accounting of hashing cost (TLLM_KVV2_HASH_STATS=1): each
+// rank periodically logs cumulative wall-ns, tokens and calls spent in the
+// batch hash path below. Zero overhead when disabled.
+struct HashStats
+{
+    std::atomic<uint64_t> ns{0};
+    std::atomic<uint64_t> tokens{0};
+    std::atomic<uint64_t> calls{0};
+};
+
+HashStats& hashStats()
+{
+    static HashStats s;
+    return s;
+}
+
+bool hashStatsEnabled()
+{
+    static bool const enabled = []
+    {
+        char const* e = std::getenv("TLLM_KVV2_HASH_STATS");
+        return e != nullptr && e[0] == '1';
+    }();
+    return enabled;
+}
+
+bool hashBatchEnabled()
+{
+    // TLLM_KVV2_HASH_BATCH=0 falls back to the historical per-token
+    // blake3_hasher_update calls (for controlled A/B of the batching below).
+    static bool const enabled = []
+    {
+        char const* e = std::getenv("TLLM_KVV2_HASH_BATCH");
+        return e == nullptr || e[0] != '0';
+    }();
+    return enabled;
+}
+} // namespace
+
 Hasher& Hasher::update(TokenIdExt const* tokens, size_t count)
 {
-    // Python uses array("Q", data).tobytes() to reduce per-token interpreter
-    // overhead.  In C++ the compiler inlines each update() call, so the loop
-    // is already optimal; batching would only add a heap allocation.
-    for (size_t i = 0; i < count; ++i)
-        update(tokens[i]);
+    // Batch plain token ids into a contiguous little-endian buffer and feed
+    // BLAKE3 with one update per 4KB: per-8-byte blake3_hasher_update calls
+    // pay the full incremental-state overhead per token (measured 2.1x slower
+    // per 128-token block on Grace, where the single-stream compress path has
+    // no NEON variant). Byte stream is identical to the per-token path, so
+    // digests are unchanged.
+    auto const t0 = hashStatsEnabled() ? std::chrono::steady_clock::now().time_since_epoch().count() : 0;
+    if (!hashBatchEnabled())
+    {
+        for (size_t i = 0; i < count; ++i)
+            update(tokens[i]);
+    }
+    else
+    {
+        constexpr size_t kBatchTokens = 512;
+        uint8_t buf[kBatchTokens * 8];
+        size_t n = 0;
+        auto flush = [&]
+        {
+            if (n != 0)
+            {
+                blake3_hasher_update(&mState, buf, n * 8);
+                n = 0;
+            }
+        };
+        for (size_t i = 0; i < count; ++i)
+        {
+            if (auto const* id = std::get_if<TokenId>(&tokens[i]))
+            {
+                auto const u = static_cast<uint64_t>(static_cast<int64_t>(*id));
+                uint8_t* p = buf + n * 8;
+                for (int b = 0; b < 8; ++b)
+                {
+                    p[b] = static_cast<uint8_t>((u >> (8 * b)) & 0xFFU);
+                }
+                if (++n == kBatchTokens)
+                {
+                    flush();
+                }
+            }
+            else
+            {
+                flush();
+                update(tokens[i]);
+            }
+        }
+        flush();
+    }
+    if (t0 != 0)
+    {
+        auto& st = hashStats();
+        st.ns += static_cast<uint64_t>(std::chrono::steady_clock::now().time_since_epoch().count() - t0);
+        st.tokens += count;
+        auto const calls = ++st.calls;
+        if (calls % 100000 == 0)
+        {
+            std::fprintf(stderr, "[KVV2_HASH_STATS] calls=%llu tokens=%llu hash_ms=%.1f batch=%d\n",
+                static_cast<unsigned long long>(calls), static_cast<unsigned long long>(st.tokens.load()),
+                st.ns.load() / 1e6, hashBatchEnabled() ? 1 : 0);
+        }
+    }
     return *this;
 }
 
