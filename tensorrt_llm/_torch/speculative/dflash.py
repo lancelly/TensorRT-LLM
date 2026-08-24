@@ -25,6 +25,7 @@ from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
 
 from ..attention_backend import AttentionMetadata
+from ..pyexecutor.llm_request import ATTENTION_DP_DUMMY_REQUEST_ID
 from ..pyexecutor.mamba_cache_manager import MambaHybridCacheManager
 from ..pyexecutor.resource_manager import BaseResourceManager
 from .accept_stats import maybe_create_recorder
@@ -129,6 +130,28 @@ class DFlashSpecMetadata(SpecMetadata):
                     slot = worker._req_to_slot.pop(rid)
                     worker._ctx_len[slot] = 0
                     worker._free_slots.append(slot)
+
+            # Assign a persistent context slot to every real generation
+            # request that never ran a context forward on this worker. In
+            # disaggregated serving the prompt is prefilled on the CONTEXT
+            # server, so _store_prefill_context never runs here and
+            # _req_to_slot stays empty; without this, all transferred gen
+            # requests would alias the shared scratch row below and corrupt
+            # each other's accumulated context at batch size > 1 (the
+            # standalone twin of the embedded-DSpark GitHub #16767 fix). The
+            # slot starts with ctx_len = 0 — the drafter sees no prompt
+            # context and refills from accepted gen tokens, so acceptance is
+            # degraded until a ctx->gen window transfer exists, but verify
+            # keeps outputs correct and requests stay isolated.
+            num_contexts = max(0, len(self.request_ids) - self.num_generations)
+            for rid in self.request_ids[num_contexts:]:
+                if (rid != ATTENTION_DP_DUMMY_REQUEST_ID
+                        and rid < worker._graph_dummy_id_floor
+                        and rid not in worker._req_to_slot
+                        and worker._free_slots):
+                    slot = worker._free_slots.popleft()
+                    worker._req_to_slot[rid] = slot
+                    worker._ctx_len[slot] = 0
 
             # Route unknown request IDs (cuda graph padding or warmup dummies)
             # to dummy slot to avoid corrupting real request's context
@@ -311,6 +334,12 @@ class DFlashWorker(SpecWorkerBase):
         # dummies; real requests only draw slots 0..max_batch-1, so dummy
         # writes land here and can't corrupt a real request's context.
         self._dummy_slot = max_batch
+        # CUDA-graph padding requests draw ids just below
+        # CUDA_GRAPH_DUMMY_REQUEST_ID; the floor cleanly separates them from
+        # real ids so the disagg gen-worker slot bootstrap in
+        # DFlashSpecMetadata.prepare never assigns them a real slot.
+        from ..pyexecutor.cuda_graph_runner import CUDA_GRAPH_DUMMY_REQUEST_ID
+        self._graph_dummy_id_floor = CUDA_GRAPH_DUMMY_REQUEST_ID - self.max_draft_len
         num_slots = max_batch + 1
 
         self._ctx_len = torch.zeros(num_slots, dtype=torch.long, device="cuda")
