@@ -131,18 +131,14 @@ class DFlashSpecMetadata(SpecMetadata):
                     worker._ctx_len[slot] = 0
                     worker._free_slots.append(slot)
 
-            # Assign a persistent context slot to every real generation
-            # request that never ran a context forward on this worker. In
-            # disaggregated serving the prompt is prefilled on the CONTEXT
+            # In disaggregated serving the prompt is prefilled on the CONTEXT
             # server, so _store_prefill_context never runs here and
-            # _req_to_slot stays empty; without this, all transferred gen
-            # requests would alias the shared scratch row below and corrupt
-            # each other's accumulated context at batch size > 1 (the
-            # standalone twin of the embedded-DSpark GitHub #16767 fix). The
-            # slot starts with ctx_len = 0 — the drafter sees no prompt
-            # context and refills from accepted gen tokens, so acceptance is
-            # degraded until a ctx->gen window transfer exists, but verify
-            # keeps outputs correct and requests stay isolated.
+            # _req_to_slot stays empty; without a slot every transferred gen
+            # request would alias the shared scratch row below and corrupt the
+            # others at batch size > 1 (standalone twin of GitHub #16767).
+            # ctx_len starts at 0: the drafter refills from accepted tokens,
+            # which costs acceptance until a ctx->gen window transfer exists
+            # but keeps requests isolated and verified output correct.
             num_contexts = max(0, len(self.request_ids) - self.num_generations)
             for rid in self.request_ids[num_contexts:]:
                 if (rid != ATTENTION_DP_DUMMY_REQUEST_ID
