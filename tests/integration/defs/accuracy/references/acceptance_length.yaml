@@ -42,3 +42,13 @@ TestKimiK3::test_w4a16_mxfp4:
 TestQwen3_8B::test_dspark:
   ref_al: 6.259
   min_al: 5.946
+# ref_al is the median of 5.33/5.43/5.53 measured during bring-up, but on a
+# 200-sample chat-template subset rather than this harness's full 1,319-sample
+# stock workload -- the workload moves acceptance, so min_al is a loose
+# acceptance-collapse tripwire, not the populate-path 95% default. A drafter
+# whose slots collapse scores 1.09 with every accuracy gate still passing;
+# 3.0 separates that from anything healthy. Tighten both once this test's own
+# runs establish a baseline.
+TestKimiK3::test_gsm8k_tep8_dspark:
+  ref_al: 5.43
+  min_al: 3.0
