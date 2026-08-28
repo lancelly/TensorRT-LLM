@@ -318,6 +318,10 @@ moonshotai/Kimi-K3:
   # SA spec dec is lossless; scores match the baseline within noise.
   - spec_dec_algo: SA
     accuracy: 96.5
+  # Same, for the standalone DSpark drafter. Measured 97.0-97.5 on a
+  # 200-sample TEP8 subset while bringing up the drafter's paged KV path.
+  - spec_dec_algo: DSpark
+    accuracy: 96.5
 nvidia/Llama-3_3-Nemotron-Super-49B-v1:
   - accuracy: 92.57
   - quant_algo: FP8
