@@ -130,14 +130,11 @@ class MambaRole:
 def _mamba_effective_tp_size(mapping: Mapping) -> int:
     """TP degree for sizing per-rank mamba/KDA state pools.
 
-    Attention-DP replicates the state and takes precedence; helix
-    repurposes CP ranks as plain TP for recurrent-state layers.
+    Delegates to config_utils.mamba_effective_tp_size so the budgeting
+    estimator and the runtime allocator can never diverge again.
     """
-    if mapping.enable_attention_dp:
-        return 1
-    if mapping.has_cp_helix():
-        return mapping.tp_size * mapping.cp_size
-    return mapping.tp_size
+    from .config_utils import mamba_effective_tp_size
+    return mamba_effective_tp_size(mapping)
 
 
 def get_tensor_size_bytes(tensor):
