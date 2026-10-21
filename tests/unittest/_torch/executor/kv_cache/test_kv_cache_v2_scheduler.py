@@ -24,6 +24,7 @@ import pytest
 
 from tensorrt_llm._torch.pyexecutor.ced_replay import EncoderReplay, encoder_replay_tokens
 from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import (
+    _INFLIGHT_PREFIX_MAX_WAIT_PASSES,
     BlockReusePolicy,
     KVCacheManagerV2,
 )
@@ -636,6 +637,7 @@ def make_kv_cache_manager(
     # Default: no request contributes a full new block, so the prefix-aware
     # skip never fires and tests that don't care about it are unaffected.
     mgr.probe_first_new_block_key.side_effect = first_new_block_fn or (lambda req: None)
+    mgr.plan_context_waits.return_value = {}
     mgr.kv_cache_map = _KVCacheMap()
     mgr.prepare_context.side_effect = prepare_context_fn or (lambda req, reuse_limit=None: True)
     mgr.prepare_context_cache.side_effect = lambda req, reuse_limit=None: 0
@@ -917,6 +919,74 @@ class TestTokenBudget:
 # ===========================================================================
 # Draft Token Budget Interaction (Non-Chunked)
 # ===========================================================================
+
+
+class TestInflightPrefixWait:
+    def test_waiting_request_stays_queued(self):
+        mgr = make_kv_cache_manager()
+        mgr.plan_context_waits.return_value = {1: None}
+        sched = make_scheduler(mgr, max_num_tokens=1000)
+        reqs = [make_ctx_request(i, context_remaining_length=100) for i in range(3)]
+        out = sched.schedule_request(reqs, set())
+        assert ids(out.context_requests) == [0, 2]
+        mgr.plan_context_waits.assert_called_once_with(reqs)
+
+    def test_request_waits_for_a_new_request_admitted_ahead_of_it(self):
+        mgr = make_kv_cache_manager()
+        mgr.plan_context_waits.return_value = {1: 0, 2: 0}
+        sched = make_scheduler(mgr, max_num_tokens=1000)
+        reqs = [make_ctx_request(i, context_remaining_length=100) for i in range(3)]
+        out = sched.schedule_request(reqs, set())
+        assert ids(out.context_requests) == [0]
+
+    def test_request_does_not_wait_for_a_new_request_left_queued(self):
+        # Request 0 does not get its pages, so it prefills nothing this pass.
+        mgr = make_kv_cache_manager(resize_context_fn=lambda req, n: req.py_request_id != 0)
+        mgr.plan_context_waits.return_value = {1: 0}
+        sched = make_scheduler(mgr, max_num_tokens=1000)
+        reqs = [make_ctx_request(i, context_remaining_length=100) for i in range(2)]
+        out = sched.schedule_request(reqs, set())
+        assert ids(out.context_requests) == [1]
+
+    def test_pass_where_every_request_waits_is_a_bounded_stall(self):
+        """A pass in which every pending request waits for a prefilling owner
+        schedules nothing and counts as a stall, but the wait bound ends it
+        long before the deadlock threshold."""
+        mgr = make_kv_cache_manager()
+        reqs = [make_ctx_request(i, context_remaining_length=100) for i in range(3)]
+        passes = [0]
+
+        def plan_context_waits(pending):
+            # The manager stops a request's wait after the bound.
+            passes[0] += 1
+            if passes[0] > _INFLIGHT_PREFIX_MAX_WAIT_PASSES:
+                return {}
+            return {req.py_request_id: None for req in pending}
+
+        mgr.plan_context_waits.side_effect = plan_context_waits
+        sched = make_scheduler(mgr, max_num_tokens=1000)
+        assert _INFLIGHT_PREFIX_MAX_WAIT_PASSES < sched._DEADLOCK_STALL_ITERS
+        for num_passes in range(1, _INFLIGHT_PREFIX_MAX_WAIT_PASSES + 1):
+            out = sched.schedule_request(reqs, set())
+            assert ids(out.context_requests) == []
+            assert sched._stalled_schedules == num_passes
+        out = sched.schedule_request(reqs, set())
+        assert ids(out.context_requests) == [0, 1, 2]
+        assert sched._stalled_schedules == 0
+
+    def test_prefix_wait_does_not_hide_a_stall(self):
+        """A wait that never ends is reported like any other stall."""
+        mgr = make_kv_cache_manager()
+        mgr.plan_context_waits.side_effect = lambda pending: {
+            req.py_request_id: None for req in pending
+        }
+        sched = make_scheduler(mgr, max_num_tokens=1000)
+        sched._DEADLOCK_STALL_ITERS = 3
+        reqs = [make_ctx_request(i, context_remaining_length=100) for i in range(2)]
+        for _ in range(2):
+            sched.schedule_request(reqs, set())
+        with pytest.raises(RuntimeError, match="V2 scheduler deadlock"):
+            sched.schedule_request(reqs, set())
 
 
 class TestDraftTokenBudget:

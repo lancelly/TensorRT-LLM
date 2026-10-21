@@ -1148,13 +1148,22 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
     @override
     def prepare_expect_snapshot_points(self, requests: List[LlmRequest]) -> None:
         super().prepare_expect_snapshot_points(requests)
-        if (
-            not self.enable_block_reuse
-            or not self.kv_cache_config.block_reuse_config.enable_branch_snapshot
-        ):
-            return
-        for request in requests:
-            self._apply_branch_snapshot_point(request)
+        block_reuse_config = self.kv_cache_config.block_reuse_config
+        if self.enable_block_reuse and block_reuse_config.enable_branch_snapshot:
+            for request in requests:
+                self._apply_branch_snapshot_point(request)
+        if self._requested_snapshot_points:
+            for request in requests:
+                self._apply_requested_snapshot_points(request)
+
+    @override
+    def _request_snapshot_point(self, owner: LlmRequest, point: int) -> bool:
+        """Snapshot ``owner`` at ``point`` for a request waiting for that prefix.
+
+        The recurrent state reaches the radix tree only at snapshot points, so
+        ``owner`` always needs one there.
+        """
+        return self._add_requested_snapshot_point(owner, point)
 
     def _skip_branch_snapshot(self, reason: str) -> None:
         self._branch_snapshots_skipped_total[reason] = (

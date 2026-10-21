@@ -590,6 +590,8 @@ class KVCacheV2Scheduler(RequestScheduler):
         # iteration as a stall even though the contributor is running. Deferring
         # is itself the progress in that case.
         deferred_behind_contributor = False
+        # New requests that wait for a prefix another request is prefilling.
+        prefix_waits = self.kv_cache_manager.plan_context_waits(pending_ctx) if pending_ctx else {}
 
         # After any reordering: pre-grown requests go first so no other request
         # takes the budget their replay needs (stable sort).
@@ -605,6 +607,13 @@ class KVCacheV2Scheduler(RequestScheduler):
         for req in pending_ctx:
             if budget.requests_full:
                 break
+            if req.py_request_id in prefix_waits:
+                # A request new in this pass only prefills the prefix if it was
+                # admitted ahead of this one. A prefix wait is not progress; see
+                # the invariant below.
+                owner_id = prefix_waits[req.py_request_id]
+                if owner_id is None or any(r.py_request_id == owner_id for r in scheduled_ctx):
+                    continue
             # A radix probe cannot affect admission once the chunk token budget
             # is exhausted. Keep scanning: an encoder request may still fit.
             if (
@@ -684,6 +693,16 @@ class KVCacheV2Scheduler(RequestScheduler):
                 # a request is only ever deferred behind a contributor that
                 # actually runs this iteration, so a deferral always leaves
                 # either inflight_request_ids or scheduled_ctx non-empty.
+                #
+                # A prefix wait (plan_context_waits) is deliberately not
+                # progress. Its owner is either scheduled in this pass or a
+                # prefilling request that is itself a context candidate, and
+                # each request waits at most _INFLIGHT_PREFIX_MAX_WAIT_PASSES
+                # (128) passes in total, well below _DEADLOCK_STALL_ITERS. A
+                # pass that only waits therefore counts as a stall but cannot
+                # trip the detector by itself, while counting it as progress
+                # would let a stalled owner plus new sibling arrivals hide a
+                # real deadlock.
                 if first_new_block is not None:
                     contributed_blocks.add(first_new_block)
 
