@@ -102,15 +102,27 @@ def plan_kv_balanced_admission(
 ) -> List[Tuple[int, int]]:
     """Plan which candidates to admit and on which rank.
 
-    Ranks step in lockstep under attention DP, so the step time follows the
-    rank holding the most KV. The target is the mean per-rank load once every
-    admitted slot holds an average-sized candidate. Each admission goes to the
-    least-loaded rank below its fair share of requests and takes the
-    candidate that brings that rank closest to the target; forced candidates
-    are taken first, in queue order. The fair share, ``ceil((requests + 1) /
-    ranks)`` before each admission, keeps per-rank request counts as even as
-    count-balanced routing does: a rank whose requests are short cannot take
-    every slot and leave the long requests to the few ranks with slots left.
+    Ranks step in lockstep under attention DP, so a decode step waits for the
+    slowest rank. Its time grows with two maxima over the ranks: the most KV
+    tokens on one rank (attention over the KV) and the most requests on one
+    rank (per-request work, such as linear-attention state updates). Every
+    placement therefore first avoids raising the largest per-rank request
+    count; that is the only count constraint, so ranks below the largest count
+    stay free to take KV.
+
+    When every candidate is admitted, the plan only chooses ranks: candidates
+    go largest first, each to an open rank that raises neither maximum, and
+    among those to the rank it leaves closest below the current KV maximum
+    (best fit), which keeps the lightest ranks free for long requests that
+    arrive later. When every open rank raises a maximum, the smallest rise
+    wins, then the least-loaded rank.
+
+    When there are more candidates than admissions, each admission takes the
+    (candidate, rank) pair that does not raise the request-count maximum and
+    brings the rank closest to the target, the mean per-rank load once every
+    admission holds an average-sized candidate; ties go to the earlier
+    candidate. Forced candidates are taken first, in queue order, on the rank
+    the best-fit rule picks.
 
     Args:
         candidate_tokens: KV tokens of each candidate, in queue order.
@@ -133,26 +145,52 @@ def plan_kv_balanced_admission(
     if budget <= 0:
         return plan
 
-    avg_candidate_tokens = sum(candidate_tokens) / len(candidate_tokens)
-    target = (sum(loads) + avg_candidate_tokens * budget) / num_ranks
+    def open_ranks() -> List[int]:
+        return [r for r in range(num_ranks) if counts[r] < max_requests_per_rank]
 
-    for _ in range(budget):
-        fair_share = min(-(-(sum(counts) + 1) // num_ranks), max_requests_per_rank)
-        # The rank with the fewest requests is always below the fair share.
-        rank = min(
-            (r for r in range(num_ranks) if counts[r] < fair_share),
-            key=lambda r: (loads[r], r),
-        )
-        forced = [idx for idx in remaining if candidate_forced[idx]]
-        if forced:
-            idx = forced[0]
-        else:
-            wanted_tokens = target - loads[rank]
-            idx = min(remaining, key=lambda i: (abs(candidate_tokens[i] - wanted_tokens), i))
+    def best_fit_rank(tokens: int) -> int:
+        max_count, max_load = max(counts), max(loads)
+
+        def key(rank: int) -> Tuple[int, int, int, int]:
+            count_rise = max(0, counts[rank] + 1 - max_count)
+            load_rise = max(0, loads[rank] + tokens - max_load)
+            if count_rise == 0 and load_rise == 0:
+                return count_rise, load_rise, max_load - loads[rank] - tokens, rank
+            return count_rise, load_rise, loads[rank], rank
+
+        return min(open_ranks(), key=key)
+
+    def admit(idx: int, rank: int) -> None:
         plan.append((idx, rank))
         remaining.remove(idx)
         loads[rank] += candidate_tokens[idx]
         counts[rank] += 1
+
+    if budget == len(remaining):
+        for idx in sorted(remaining, key=lambda i: (-candidate_tokens[i], i)):
+            admit(idx, best_fit_rank(candidate_tokens[idx]))
+        return plan
+
+    avg_candidate_tokens = sum(candidate_tokens) / len(candidate_tokens)
+    target = (sum(loads) + avg_candidate_tokens * budget) / num_ranks
+
+    for _ in range(budget):
+        forced = [idx for idx in remaining if candidate_forced[idx]]
+        if forced:
+            admit(forced[0], best_fit_rank(candidate_tokens[forced[0]]))
+            continue
+        max_count = max(counts)
+        _, _, idx, rank = min(
+            (
+                max(0, counts[r] + 1 - max_count),
+                abs(candidate_tokens[i] - (target - loads[r])),
+                i,
+                r,
+            )
+            for r in open_ranks()
+            for i in remaining
+        )
+        admit(idx, rank)
     return plan
 
 
@@ -433,9 +471,12 @@ class DefaultADPRouter(ADPRouter):
     ``KV_BALANCE_WINDOW`` queued requests are all such requests (without
     child requests or a strict ``attention_dp_rank``, see
     ``_is_kv_balanced_request``), ``pop_requests`` plans admission and
-    placement together (``plan_kv_balanced_admission``): each slot, on a rank
-    below its fair share of requests, takes the request from that window that
-    brings its rank closest to the mean load. A request passed over for
+    placement together (``plan_kv_balanced_admission``): no placement raises
+    the largest per-rank request count while another rank can take the
+    request; when the whole window fits, each request goes, largest first, to
+    the rank it leaves closest below the largest per-rank KV load; otherwise
+    each slot takes the request from that window that brings its rank closest
+    to the mean load. A request passed over for
     ``KV_BALANCE_MAX_SKIPPED_ROUNDS`` admission rounds while in that window is
     admitted next. That bound is exact under FCFS; under the priority policy
     (or GEN admission ordering), a request pushed out of the window by requests

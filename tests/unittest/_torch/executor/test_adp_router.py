@@ -1851,8 +1851,8 @@ class TestPlanKVBalancedAdmission:
         assert all(rank == 1 for _, rank in plan)
         assert plan_kv_balanced_admission([1], [False], [0], [0], 1, 0) == []
 
-    def test_rank_takes_no_more_than_its_fair_share(self):
-        # Rank 0 holds the least KV but already its share of requests, so the
+    def test_admission_does_not_raise_the_largest_request_count(self):
+        # Rank 0 holds the least KV but already the most requests, so the
         # next admissions go to the ranks with fewer requests.
         plan = plan_kv_balanced_admission(
             candidate_tokens=[100, 100, 100],
@@ -1863,6 +1863,54 @@ class TestPlanKVBalancedAdmission:
             max_new_requests=2,
         )
         assert sorted(rank for _, rank in plan) == [1, 2]
+
+    def test_rank_below_the_largest_request_count_takes_kv(self):
+        # Rank 1 already holds an even share of the requests (ceil(15 / 4) = 4)
+        # but fewer than rank 0, so it can still take the request, which would
+        # push any other rank past the largest KV load.
+        plan = plan_kv_balanced_admission(
+            candidate_tokens=[20000],
+            candidate_forced=[False],
+            rank_tokens=[100000, 10000, 95000, 99000],
+            rank_num_requests=[6, 4, 2, 2],
+            max_requests_per_rank=16,
+            max_new_requests=1,
+        )
+        assert plan == [(0, 1)]
+
+    def test_whole_window_is_placed_largest_first(self):
+        # Both requests are admitted; placing the long one first puts it on the
+        # empty rank. In queue order the short one would take the empty rank
+        # and the long one would land on top of rank 1's 5000 tokens.
+        plan = plan_kv_balanced_admission(
+            candidate_tokens=[1000, 9000],
+            candidate_forced=[False, False],
+            rank_tokens=[0, 5000],
+            rank_num_requests=[0, 0],
+            max_requests_per_rank=4,
+            max_new_requests=4,
+        )
+        assert plan == [(1, 0), (0, 1)]
+
+    def test_best_fit_keeps_the_light_rank_for_a_long_request(self):
+        # A short request goes to the rank it leaves closest below the largest
+        # KV load (rank 2), not to the least-loaded rank, so a long request
+        # admitted in a later iteration still fits under that load on rank 1.
+        rank_tokens = [100000, 20000, 60000]
+        rank_num_requests = [4, 3, 3]
+        for tokens, expected_rank in ((30000, 2), (70000, 1)):
+            plan = plan_kv_balanced_admission(
+                candidate_tokens=[tokens],
+                candidate_forced=[False],
+                rank_tokens=rank_tokens,
+                rank_num_requests=rank_num_requests,
+                max_requests_per_rank=16,
+                max_new_requests=1,
+            )
+            assert plan == [(0, expected_rank)]
+            rank_tokens[expected_rank] += tokens
+            rank_num_requests[expected_rank] += 1
+        assert max(rank_tokens) == 100000
 
 
 class TestDefaultADPRouterKVBalance:
@@ -1911,7 +1959,7 @@ class TestDefaultADPRouterKVBalance:
         assert len(chosen) == 1
         assert chosen[0].id < KV_BALANCE_WINDOW
 
-    def test_route_balances_kv_within_the_fair_share(self):
+    def test_route_balances_kv_without_raising_the_request_count(self):
         router = DefaultADPRouter(dist=_mock_dist(tp_size=2))
         states = _kv_states(tokens=[0, 0], active=[0, 0])
         queue = _gen_only_queue([9000, 3000, 3000, 3000])
